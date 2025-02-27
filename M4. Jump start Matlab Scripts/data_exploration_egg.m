@@ -7,8 +7,8 @@ clear all;
 
 %% load edf and xml files of several files
 addpath("Scripts\")
-edfFilename = 'Data/R4.edf';
-xmlFilename = 'Data/R4.xml';
+edfFilename = 'data/R4.edf';
+xmlFilename = 'data/R4.xml';
 [hdr, record] = edfread(edfFilename);
 [events, stages, epochLength,annotation] = readXML(xmlFilename);
 
