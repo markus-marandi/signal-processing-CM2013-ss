@@ -1,3 +1,14 @@
+% --------------------------- 
+% Add your custom Scripts folder (where edfread.m is located) to the beginning of the path
+%addpath(fullfile(pwd, 'Scripts'), '-begin');
+
+% Refresh the function cache
+%rehash toolboxcache;
+
+% Verify that MATLAB now sees your custom edfread.m first
+% which edfread -all
+% ---------------------------
+
 % ---------------------------
 %  Batch EOG Processing and Summary Graphs
 % ---------------------------
