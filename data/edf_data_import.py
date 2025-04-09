@@ -83,53 +83,35 @@ def describe_edf_mat_structure(mat_file):
 
 def extract_eeg_signal(mat_file, edf_index=0, channel=0):
     """
-    Extracts the EEG signal from the specified EDF file within the MAT file.
+    Extracts the EEG signal from the specified EDF file.
 
-    This updated function assumes that:
-      - The MAT file contains a group 'allData'.
-      - All EDF records are stored in the dataset 'record' within the 'allData' group.
-      - 'allData/record' is a dataset of references, one per EDF file.
-      - Each reference points to a subgroup (or dataset) that holds a 2D array (channels x samples).
+    This function assumes that the 'record' data in the MAT file is stored with
+    shape (n_samples, n_channels). Thus, to select a channel, we use rec[:, channel].
 
     Parameters:
-      mat_file : path to the MAT file.
-      edf_index: index of the EDF file to use (default is the first one, index 0).
-      channel  : channel index to extract (for example, 0 for the first EEG channel).
+      mat_file : Path to the MAT file.
+      edf_index: Index of the EDF file to extract from.
+      channel  : Index of the desired channel (e.g., EEG channel index).
 
     Returns:
-      signal   : the extracted EEG signal (numpy array).
+      signal   : The extracted signal (a 1D numpy array with n_samples).
     """
+    import h5py
     with h5py.File(mat_file, 'r') as f:
-        # Check that 'allData' group exists
-        if 'allData' not in f:
-            raise KeyError("The MAT file does not contain an 'allData' group.")
         allData = f['allData']
-
-        # Get the 'record' dataset that holds references to each EDF's record.
         if 'record' not in allData:
             raise KeyError("The 'allData' group does not contain a 'record' dataset.")
         record_ds = allData['record']
-
-        # Check that the dataset has enough entries for the requested index.
         if edf_index >= record_ds.shape[0]:
             raise IndexError("edf_index is out of bounds.")
-
-        # Get the reference for the selected EDF file's record.
-        # Note: The record dataset is stored as a 2D array (nEDF x 1)
+        # Get the reference for the given EDF file
         ref = record_ds[edf_index, 0]
-        # Dereference to get the actual data.
         rec = f[ref][()]
-
-        # Verify that the record is 2D (channels x samples)
+        # Make sure that the data is in a shape (n_samples, n_channels)
         if rec.ndim != 2:
-            raise ValueError("Expected 'record' dataset to be 2D (channels x samples).")
-
-        # Ensure the requested channel index is valid.
-        if channel >= rec.shape[0]:
-            raise IndexError("Channel index out of bounds for this EDF file.")
-
-        # Extract and return the channel.
-        signal = rec[channel, :]
+            raise ValueError("Expected 'record' to be a 2D array (samples x channels).")
+        # Use slicing along the first axis to extract the full time series for the channel.
+        signal = rec[:, channel]
     return signal
 
 
@@ -183,40 +165,29 @@ def compute_signal_features(signal):
 
 def extract_all_eeg_signals(mat_file, channel=0):
     """
-    Extracts the EEG signal (a specific channel) from all EDF files in the MAT file.
+    Extracts a specific EEG channel from all EDF files in the MAT file.
 
     Parameters:
-      mat_file: Path to the MATLAB MAT file.
-      channel : The channel index to extract from each EDF file (default is 0 for the first EEG channel).
+      mat_file: Path to the MAT file.
+      channel : The channel index to extract from each EDF file.
 
     Returns:
-      signals: A list of numpy arrays, one for each EDF file.
+      signals: A list of 1D numpy arrays, each array corresponding to one EDF file.
     """
     signals = []
+    import h5py
     with h5py.File(mat_file, 'r') as f:
-        # Confirm 'allData' group exists.
-        if 'allData' not in f:
-            raise KeyError("The MAT file does not contain an 'allData' group.")
         allData = f['allData']
-
-        # Access the 'record' dataset which stores references for each EDF record.
         if 'record' not in allData:
             raise KeyError("The 'allData' group does not contain a 'record' dataset.")
         record_ds = allData['record']
-
         n_edf = record_ds.shape[0]
         for edf_index in range(n_edf):
-            # Get the reference for this EDF record.
             ref = record_ds[edf_index, 0]
             rec = f[ref][()]
-            # Make sure 'rec' is a 2D array (channels x samples).
             if rec.ndim != 2:
-                raise ValueError("Expected 'record' dataset to be 2D (channels x samples).")
-            # Check that the requested channel index exists for this EDF record.
-            if channel >= rec.shape[0]:
-                raise IndexError(f"Channel index {channel} is out of bounds for EDF file at index {edf_index}.")
-            # Extract the specified channel.
-            signal = rec[channel, :]
+                raise ValueError("Expected each 'record' to be 2D (samples x channels).")
+            signal = rec[:, channel]
             signals.append(signal)
     return signals
 
