@@ -5,6 +5,10 @@ import os
 import pickle
 import preprocess_library as prepro_lib
 from scipy import signal
+import pywt
+import pandas as pd
+from scipy.stats import skew
+from scipy.integrate import simpson
 
 
 
@@ -49,5 +53,38 @@ if __name__ == "__main__":
 
     filtered_data = prepro_lib.filter_data(raw_data, channels, sampling_rate, output_dir, normalize=True)
 
-    processed_data = prepro_lib.create_epochs(filtered_data, channels, sampling_rate, output_dir)
+    # Apply ICA for artifact removal
+    ica_cleaned_data = prepro_lib.apply_ica(filtered_data, channels, sampling_rate, output_dir)
+
+    # Create epochs from the ICA-cleaned data
+    processed_data = prepro_lib.create_epochs(ica_cleaned_data, channels, sampling_rate, output_dir)
     print(f"\nExample epoch shape: {processed_data[1][channels[5]][0]}")
+
+    # Perform wavelet decomposition
+    wavelet_data = prepro_lib.wavelet_decomposition(processed_data, channels, sampling_rate, output_dir)
+
+    # Example: Print the shape of Delta band epochs for EEG channel of the first subject
+    if wavelet_data and channels[7] in wavelet_data[0]:
+        print(f"Shape of Delta band epochs for {channels[7]} (Subject 1): {wavelet_data[0][channels[7]]['Delta'].shape}")
+
+    # Perform spindle detection
+    spindle_results = prepro_lib.spindle_detection(wavelet_data, channels, sampling_rate, output_dir)
+
+    # Example: Print the number of spindles detected in the first epoch of EEG channel for the first subject
+    if spindle_results and channels[7] in spindle_results[0]:
+        first_epoch_mask = spindle_results[0][channels[7]][0]
+        # Find distinct spindle events (changes from False to True)
+        spindle_starts = np.where(np.diff(first_epoch_mask.astype(int)) == 1)[0]
+        num_spindles = len(spindle_starts)
+        # Handle case where spindle starts at the very beginning
+        if first_epoch_mask[0]:
+             num_spindles += 1
+        print(f"Number of spindles detected in first epoch for {channels[7]} (Subject 1): {num_spindles}")
+
+    # Extract features
+    features_dataframe = prepro_lib.extract_features(wavelet_data, spindle_results, channels, sampling_rate, output_dir)
+
+    # Display first few rows of the features dataframe
+    print("\nFeature DataFrame Head:")
+    print(features_dataframe.head())
+
