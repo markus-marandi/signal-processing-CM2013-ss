@@ -173,3 +173,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+EEG-Clasification_V4/Input/R1.edf
+*.xml
+*.edf
+*.edf
