@@ -1,0 +1,9 @@
+numpy
+matplotlib
+pypickle
+scipy
+PyWavelets
+pandas
+mne
+scikit-learn
+xgboost

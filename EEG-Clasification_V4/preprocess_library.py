@@ -8,116 +8,275 @@ from scipy.signal import resample
 from sklearn.decomposition import FastICA
 import pywt
 import pandas as pd
-from scipy.stats import skew
+from scipy.stats import skew, mode as scipy_mode
 from scipy.integrate import simpson
+import xml.etree.ElementTree as ET
+import xgboost as xgb
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
+from sklearn.preprocessing import LabelEncoder
+import joblib # For saving model and encoder
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
+from sklearn.preprocessing import StandardScaler
 
-def import_edf_data(input_dir, output_dir, mat_file, sampling_rate):
-    
-    # Create a look up table for the channels
-    channels = {
-        'EEG2': 2,  # 0-based index for position 3
-        'ECG': 3,   # 0-based index for position 4
-        'EMG': 4,   # 0-based index for position 5
-        'EOGl': 5,  # 0-based index for position 6
-        'EOGr': 6,  # 0-based index for position 7
-        'EEG': 7    # 0-based index for position 8
+def load_patient_data(num_patients, base_input_dir, channels_dict, output_dir):
+    """
+    Loads EDF and XML data for a specified number of patients.
+    Checks for cached data first and saves data if not cached.
+
+    Args:
+        num_patients (int): The number of patients to process (e.g., 10 for R1 to R10).
+        base_input_dir (str): The path to the directory containing patient files (e.g., 'Input').
+        channels_dict (dict): Dictionary mapping channel indices (int) to channel names (str).
+        output_dir (str): The path to the directory where processed data and cache files are saved.
+
+    Returns:
+        tuple: A tuple containing:
+            - list: List of dictionaries, where each dictionary holds the raw
+                    channel data for one patient (keys are channel names, values are numpy arrays).
+                    Empty dictionaries are appended for patients with loading errors.
+            - list: List of dictionaries, where each dictionary holds the XML
+                    data (events, stages, etc.) for one patient.
+                    Empty dictionaries are appended for patients with loading errors.
+    """
+    # Define cache file paths
+    raw_data_cache_path = os.path.join(output_dir, 'raw_data_list.pkl')
+    xml_data_cache_path = os.path.join(output_dir, 'xml_data_list.pkl')
+
+    # Check if cached data exists
+    if os.path.exists(raw_data_cache_path) and os.path.exists(xml_data_cache_path):
+        print(f"Loading raw and XML data from cache files in {output_dir}...")
+        try:
+            with open(raw_data_cache_path, 'rb') as f:
+                raw_data_list = pickle.load(f)
+            with open(xml_data_cache_path, 'rb') as f:
+                xml_data_list = pickle.load(f)
+            print("Successfully loaded data from cache.")
+            # Perform a basic sanity check (e.g., check length)
+            if len(raw_data_list) == num_patients and len(xml_data_list) == num_patients:
+                 print(f"Cache contains data for {len(raw_data_list)} patients.")
+                 return raw_data_list, xml_data_list
+            else:
+                 print(f"Warning: Cache data length mismatch (expected {num_patients}, found {len(raw_data_list)}). Reloading data.")
+                 # Reset lists to proceed with loading
+                 raw_data_list = []
+                 xml_data_list = []
+        except Exception as e:
+            print(f"Error loading data from cache: {e}. Proceeding to load from source files.")
+            # Reset lists in case of partial load failure
+            raw_data_list = []
+            xml_data_list = []
+    else:
+        print("Cache files not found. Loading data from source EDF and XML files...")
+        # Initialize lists if cache doesn't exist or loading failed
+        raw_data_list = []
+        xml_data_list = []
+
+
+    # --- If cache wasn't used, proceed with loading ---
+    if not raw_data_list and not xml_data_list: # Check if lists are still empty
+        # Let's Loop Over all patients files
+        for k in range(1, num_patients + 1):
+            patient_index = k - 1 # 0-based index for list access
+            print(f"--- Processing Patient R{k} (Index: {patient_index}) ---")
+            #
+            ### --- 1.LOAD DATA : Load EDF & xml file for patient R{k} ---
+            #
+            ## Construct file paths using base_input_dir
+            edf_path = os.path.join(base_input_dir, f"R{k}.edf")
+            xml_path = os.path.join(base_input_dir, f"R{k}.xml")
+
+            raw = None # Initialize raw to None for cleanup in except blocks
+            raw_picked = None # Initialize for cleanup
+
+            # Load EDF data using MNE
+            print(f"Loading EDF: {edf_path}")
+            try:
+                # Reduce MNE verbosity during loading
+                # Import mne here if not imported globally or pass it as an argument
+                import mne
+                raw = mne.io.read_raw_edf(edf_path, preload=True, verbose='WARNING')
+            except FileNotFoundError:
+                print(f"Error: EDF file not found at {edf_path}. Skipping patient {k}.")
+                raw_data_list.append({})
+                xml_data_list.append({})
+                continue # Skip to the next patient
+            except Exception as e: # Catch other potential MNE errors
+                    print(f"Error loading EDF file {edf_path}: {e}. Skipping patient {k}.")
+                    raw_data_list.append({})
+                    xml_data_list.append({})
+                    continue
+
+            # Load XML data using the library function
+            print(f"Loading XML: {xml_path}")
+            try:
+                # Assuming read_xml is defined later in this file or imported
+                events, stages, epoch_length, has_annotations = read_xml(xml_path)
+            except FileNotFoundError:
+                print(f"Error: XML file not found at {xml_path}. Skipping patient {k}.")
+                raw_data_list.append({}) # Append empty dict for raw data as well
+                xml_data_list.append({})
+                if raw: del raw # Clean up loaded raw object
+                continue # Skip to the next patient
+            except Exception as e:
+                print(f"Error reading XML file {xml_path}: {e}. Skipping patient {k}.")
+                raw_data_list.append({})
+                xml_data_list.append({})
+                if raw: del raw
+                continue
+
+            # --- Store EDF channel data ---
+            patient_raw_data = {}
+            # Use the channel names from the 'channels_dict' argument
+            channel_names_to_extract = list(channels_dict.values())
+
+            # Verify which requested channels are actually available in the EDF file
+            available_channels_in_edf = [ch for ch in channel_names_to_extract if ch in raw.ch_names]
+            missing_channels = [ch for ch in channel_names_to_extract if ch not in raw.ch_names]
+
+            if missing_channels:
+                print(f"Warning: Requested channels {missing_channels} not found in {edf_path}. Available channels: {raw.ch_names}")
+
+            # Extract data for the available channels among the requested ones
+            if available_channels_in_edf:
+                try:
+                    # Pick only the desired channels from the raw object
+                    raw_picked = raw.copy().pick(picks=available_channels_in_edf, verbose='WARNING')
+                    # Get data returns a numpy array of shape (n_channels, n_times)
+                    extracted_data = raw_picked.get_data()
+                    # Store each channel's data in the dictionary
+                    for i, name in enumerate(raw_picked.ch_names):
+                        patient_raw_data[name] = extracted_data[i]
+                    print(f"  Extracted {len(available_channels_in_edf)} channels.")
+                    # Example shape print (optional, uncomment if needed)
+                    # if patient_raw_data:
+                    #    first_ch_name = list(patient_raw_data.keys())[0]
+                    #    print(f"  Example shape for '{first_ch_name}': {patient_raw_data[first_ch_name].shape}")
+
+                except Exception as e:
+                        print(f"Error extracting channels for patient {k}: {e}")
+                        patient_raw_data = {} # Reset to empty if extraction failed
+            else:
+                print(f"Warning: None of the requested channels {channel_names_to_extract} were found in {edf_path}.")
+                # patient_raw_data remains {}
+
+            # Append the dictionary for this patient to the main list
+            raw_data_list.append(patient_raw_data)
+
+            # --- Store XML data ---
+            patient_xml_data = {
+                'events': events,
+                'stages': stages,
+                'epoch_length': epoch_length,
+                'has_annotations': has_annotations
+            }
+            # Append the dictionary for this patient to the main list
+            xml_data_list.append(patient_xml_data)
+            print(f"  Stored XML data (Events: {len(events)}, Stages: {len(stages)}, Epoch Length: {epoch_length})")
+
+            print(f"Finished processing Patient R{k}.")
+            # Clean up MNE objects to free memory
+            if raw_picked: del raw_picked
+            if raw: del raw
+
+        # After the loop summary
+        print("\n--- Data Loading Loop Complete ---")
+        print(f"Total patients attempted: {num_patients}")
+        # Count how many patients had both EDF and XML successfully loaded and processed
+        successful_loads = sum(1 for i in range(len(raw_data_list)) if raw_data_list[i] and xml_data_list[i])
+        print(f"Successfully loaded data sets (EDF+XML pairs): {successful_loads}")
+
+        # --- Save the loaded data to cache ---
+        if successful_loads > 0: # Only save if some data was actually loaded
+            print(f"\nSaving loaded raw and XML data to cache files in {output_dir}...")
+            try:
+                # Ensure output directory exists (it should, but double-check)
+                os.makedirs(output_dir, exist_ok=True)
+                with open(raw_data_cache_path, 'wb') as f:
+                    pickle.dump(raw_data_list, f)
+                with open(xml_data_cache_path, 'wb') as f:
+                    pickle.dump(xml_data_list, f)
+                print("Data successfully saved to cache.")
+            except Exception as e:
+                print(f"Error saving data to cache: {e}")
+        else:
+            print("\nNo data successfully loaded, skipping cache saving.")
+
+
+    # --- Final Summary and Return ---
+    # Example check (more robust: find first successfully loaded patient)
+    first_loaded_idx = -1
+    for i in range(len(raw_data_list)):
+            if raw_data_list[i] and xml_data_list[i]:
+                first_loaded_idx = i
+                break
+
+    if first_loaded_idx != -1:
+        print(f"\nExample: Patient {first_loaded_idx+1} raw data channels: {list(raw_data_list[first_loaded_idx].keys())}")
+        print(f"Example: Patient {first_loaded_idx+1} XML data keys: {list(xml_data_list[first_loaded_idx].keys())}")
+    elif any(raw_data_list) or any(xml_data_list):
+            print("\nSome data loaded, but no patient had both EDF and XML successfully processed.")
+    else:
+        print("\nNo patient data was successfully loaded.")
+
+
+    return raw_data_list, xml_data_list
+
+def read_xml(xml_filename):
+    """ Parses the XML file and extracts events, sleep stages, epoch length, and annotations. """
+    import xml.etree.ElementTree as ET
+    try:
+        tree = ET.parse(xml_filename)
+        root = tree.getroot()
+    except Exception as e:
+        raise RuntimeError(f"Failed to read XML file {xml_filename}: {e}")
+
+    # Extract epoch length
+    epoch_length = int(root.find("EpochLength").text)
+
+    # Define sleep stage mapping
+    stage_mapping = {
+        "SDO:NonRapidEyeMovementSleep-N1": 4,
+        "SDO:NonRapidEyeMovementSleep-N2": 3,
+        "SDO:NonRapidEyeMovementSleep-N3": 2,
+        "SDO:NonRapidEyeMovementSleep-N4": 1,
+        "SDO:RapidEyeMovementSleep": 0,  # REM sleep
+        "SDO:WakeState": 5               # Wake state
     }
-    # Create the input directory if it doesn't exist
-    if not os.path.exists(input_dir):
-        os.makedirs(input_dir)
 
-    # Create Output directory for saving processed data
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    # Initialize storage
+    events = []
+    stages = []
     
-    # Check if processed data file already exists
-    processed_data_file = os.path.join(output_dir, 'all_patients_data.pkl')
-    if os.path.exists(processed_data_file):
-        print(f"\nProcessed data file already exists at: {processed_data_file}")
-        print("Loading existing data instead of reprocessing.")
-        with open(processed_data_file, 'rb') as f:
-            all_patients_data = pickle.load(f)
-        return all_patients_data
+    # Parse events
+    for scored_event in root.find("ScoredEvents"):
+        event_concept = scored_event.find("EventConcept").text
+        start = float(scored_event.find("Start").text)
+        duration = float(scored_event.find("Duration").text)
 
-    print(f"Looking for file at: {mat_file}")
-    if not os.path.exists(mat_file):
-        print(f"Warning: {mat_file} does not exist. Please make sure the file is in the correct location.")
+        # Check if event is a sleep stage
+        if event_concept in stage_mapping:
+            stages.extend([stage_mapping[event_concept]] * int(duration))
+        else:
+            # Extract additional attributes if available
+            spo2_nadir = scored_event.find("SpO2Nadir")
+            spo2_baseline = scored_event.find("SpO2Baseline")
+            desaturation = scored_event.find("Desaturation")
 
-    # Initialize list to store all patients' data
-    all_patients_data = []
+            event_data = {
+                "EventConcept": event_concept,
+                "Start": start,
+                "Duration": duration,
+                "SpO2Nadir": float(spo2_nadir.text) if spo2_nadir is not None else None,
+                "SpO2Baseline": float(spo2_baseline.text) if spo2_baseline is not None else None,
+                "Desaturation": float(desaturation.text) if desaturation is not None else None
+            }
+            events.append(event_data)
 
-    # Load the MATLAB file using h5py
-    with h5py.File(mat_file, 'r') as f:
-        # Print available top-level keys
-        print("Top-level keys in the file:", list(f.keys()))
-        
-        # Locate all datasets with shape (4065000, 14) or similar
-        record_datasets = []
-        patient_info = []
-        
-        def find_record_datasets(name, obj):
-            if isinstance(obj, h5py.Dataset) and obj.shape[0] > 3000000 and obj.shape[1] == 14:
-                record_datasets.append((name, obj))
-                # Try to find patient information based on naming patterns
-                parts = name.split('/')
-                if len(parts) > 1:
-                    patient_id = parts[-2]  # Assuming pattern /patient_id/record
-                    patient_info.append(patient_id)
-        
-        f.visititems(find_record_datasets)
-        
-        print(f"Found {len(record_datasets)} datasets with appropriate shape")
-        for i, (name, _) in enumerate(record_datasets):
-            print(f"Dataset {i+1}: {name}")
-        
-        # Process each record dataset
-        for i, (dataset_name, dataset) in enumerate(record_datasets):
-            print(f"\nProcessing dataset {i+1}: {dataset_name}")
-            
-            # Load the data and transpose it to get (14, n)
-            record_data = dataset[:].T  # Transpose to get channels as rows
-            
-            # Extract the channels of interest
-            selected_channels = {}
-            for channel_name, channel_idx in channels.items():
-                selected_channels[channel_name] = record_data[channel_idx, :]
-            
-            # Add to all patients data list
-            all_patients_data.append(selected_channels)
-            
-            # Print information about the channels
-            print(f"Patient ID: {patient_info[i] if i < len(patient_info) else 'Unknown'}")
-            print("Selected channels shape:", {k: v.shape for k, v in selected_channels.items()})
-            
-            # Optional: Plot a small sample of each channel for visualization
-            plt.figure(figsize=(15, 10))
-            for idx, (name, data) in enumerate(selected_channels.items()):
-                # Plot only the first 1000 points to keep the visualization manageable
-                plt.subplot(len(channels), 1, idx+1)
-                plt.plot(data[:1000])
-                plt.title(f"Channel: {name}")
-                plt.ylabel("Amplitude")
-            
-            plt.tight_layout()
-            # Create Figures directory if it doesn't exist
-            figures_dir = os.path.join(os.path.dirname(input_dir), 'Figures')
-            if not os.path.exists(figures_dir):
-                os.makedirs(figures_dir)
-            
-            # Save the figure in the Figures folder
-            plt.savefig(os.path.join(figures_dir, f"patient_{i+1}_channels.png"))
-            plt.close()
-
-    # Save all patients' data in a single file for easy access
-    # Format: all_patients_data[patient_index][channel_name]
-    with open(processed_data_file, 'wb') as f:
-        pickle.dump(all_patients_data, f)
-
-    print("Processing complete! All patients' data saved to: " + processed_data_file)
-    print("You can access the data using the format: all_patients_data[patient_index][channel_name]")
-    print("See 'how_to_access_data.py' for examples on how to access the data.")
-    
-    return all_patients_data
+    return events, stages, epoch_length, bool(events)
 
 
 def create_epochs(raw_data, channels, sampling_rate, output_dir):
@@ -192,6 +351,29 @@ def create_epochs(raw_data, channels, sampling_rate, output_dir):
     
     return patients_epoch
 
+# ==== FILTER HELPERS ====
+
+def butter_bandpass(lowcut, highcut, fs, order=4):
+    nyq = 0.5 * fs
+    b, a = signal.butter(order, [lowcut / nyq, highcut / nyq], btype='band')
+    return b, a
+
+def butter_highpass(cutoff, fs, order=4):
+    nyq = 0.5 * fs
+    b, a = signal.butter(order, cutoff / nyq, btype='high')
+    return b, a
+
+def butter_lowpass(cutoff, fs, order=4):
+    nyq = 0.5 * fs
+    if cutoff >= nyq:
+        cutoff = nyq - 1  # adjust to safe margin
+    b, a = signal.butter(order, cutoff / nyq, btype='low')
+    return b, a
+
+def notch_filter(signal, fs, freq=50.0, Q=30):
+    b, a = signal.iirnotch(freq, Q, fs)
+    return signal.filtfilt(b, a, signal)
+
 
 def filter_data(raw_data, channels, sampling_rate, output_dir, normalize=True):
     """
@@ -200,8 +382,8 @@ def filter_data(raw_data, channels, sampling_rate, output_dir, normalize=True):
     
     Typical filtering ranges:
     - EEG: 0.5-30 Hz
-    - ECG: 0.5-100 Hz
-    - EMG: 20-500 Hz (we'll use 20-125 Hz since our Nyquist frequency is 125/2 = 62.5 Hz)
+    - ECG: 0.5-60 Hz
+    - EMG: 20-60 Hz
     - EOG: 0.1-10 Hz
     
     Args:
@@ -227,11 +409,11 @@ def filter_data(raw_data, channels, sampling_rate, output_dir, normalize=True):
     # Define filter parameters for each channel type
     filter_params = {
         'EEG': {'lowcut': 0.5, 'highcut': 30},
-        'EEG2': {'lowcut': 0.5, 'highcut': 30},
-        'ECG': {'lowcut': 0.5, 'highcut': 100},
+        'EEG(sec)': {'lowcut': 0.5, 'highcut': 30},
+        'ECG': {'lowcut': 0.5, 'highcut': 60},
         'EMG': {'lowcut': 20, 'highcut': 60},  # Limited by Nyquist frequency
-        'EOGl': {'lowcut': 0.1, 'highcut': 10},
-        'EOGr': {'lowcut': 0.1, 'highcut': 10}
+        'EOG(L)': {'lowcut': 0.1, 'highcut': 10},
+        'EOG(R)': {'lowcut': 0.1, 'highcut': 10}
     }
     
     # Create a copy to store filtered data
@@ -314,7 +496,7 @@ def filter_data(raw_data, channels, sampling_rate, output_dir, normalize=True):
     return filtered_data_list
 
 
-def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=['EEG', 'EEG2'], artifact_channels=['EOGl', 'EOGr', 'EMG', 'ECG']):
+def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=['EEG', 'EEG(sec)'], artifact_channels=['EOG(L)', 'EOG(R)', 'EMG', 'ECG']):
     """
     Apply Independent Component Analysis (ICA) to remove artifacts from EEG signals.
 
@@ -329,9 +511,7 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
     Returns:
         ica_cleaned_data: List of dictionaries containing patient data with cleaned EEG signals.
     """
-    # Determine if normalization was applied based on input data structure (assuming presence of mean/std implies normalization happened)
-    # This is a heuristic; ideally, the normalization status would be passed explicitly or stored with the data.
-    # For now, we'll assume the input `filtered_data` corresponds to the normalized version if it exists.
+    # Determine if normalization was applied based on input data structure
     was_normalized = '_normalized' in next((f for f in os.listdir(output_dir) if f.startswith('filtered_data')), '')
 
     file_suffix = '_normalized' if was_normalized else ''
@@ -402,7 +582,7 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
 
         print(f"  - Running ICA on matrix of shape: {ica_input_matrix.shape}")
         n_components = ica_input_matrix.shape[0] # Use number of channels as components
-        ica = FastICA(n_components=n_components, random_state=0, whiten='unit-variance', max_iter=1000, tol=0.01)
+        ica = FastICA(n_components=n_components, random_state=0, whiten='unit-variance', max_iter=10000, tol=0.01)
         
         try:
             components = ica.fit_transform(ica_input_matrix.T).T # Input should be (samples, features); components shape (n_components, n_samples)
@@ -420,7 +600,7 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
 
         print(f"  - Identifying artifact components...")
         artifact_indices = []
-        correlation_threshold = 0.6 # Adjust threshold as needed
+        correlation_threshold = 0.7 # Adjust threshold as needed
 
         # Correlate components with (resampled) artifact channels
         # component_idx_map = {name: i for i, name in enumerate(all_channel_names)} # Map name to row index in ica_input_matrix -- MOVED EARLIER
@@ -524,6 +704,152 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
         pickle.dump(ica_cleaned_data_list, f)
 
     return ica_cleaned_data_list
+
+
+def lms_filter(d, x, M=10, mu=0.01):
+    """Applies the LMS adaptive filter.
+
+    Args:
+        d (np.ndarray): The desired signal (e.g., noisy EEG).
+        x (np.ndarray): The reference noise signal (e.g., EOG).
+        M (int): Filter order (number of weights).
+        mu (float): Learning rate (step size).
+
+    Returns:
+        np.ndarray: The filtered signal (error signal e).
+    """
+    N = len(d)
+    if N != len(x):
+        raise ValueError("Desired signal and reference noise must have the same length.")
+    
+    # Initialize weights and signals
+    w = np.zeros(M)
+    e = np.zeros(N) # Error signal (cleaned signal)
+    y = np.zeros(N) # Filter output (estimated noise in d)
+
+    # Pad x at the beginning to handle initial filter states
+    x_padded = np.pad(x, (M-1, 0), 'constant')
+
+    # Iterate through samples
+    for n in range(N):
+        x_vec = x_padded[n : n+M][::-1] # Input vector (past M samples including current)
+        y[n] = np.dot(w, x_vec)         # Filter output
+        e[n] = d[n] - y[n]             # Error signal (desired - output)
+        
+        # Update weights: w = w + mu * e * x
+        # Add a small stability factor related to input power, prevents instability if x_vec is large
+        norm_factor = 1 + np.dot(x_vec, x_vec) 
+        w = w + (mu / norm_factor) * e[n] * x_vec 
+
+    return e
+
+
+def adaptive_filter(input_data, channels, sampling_rate, output_dir, 
+                      eeg_channels=['EEG', 'EEG(sec)'], 
+                      reference_channels=['EOG(L)', 'EOG(R)', 'EMG', 'ECG'],
+                      lms_order=10, lms_mu=0.01):
+    """
+    Applies adaptive filtering (LMS) to remove noise from EEG signals using reference channels.
+
+    Args:
+        input_data (list): List of dictionaries containing patient data (NumPy arrays).
+                           Expected to be the output of a previous step like filtering or ICA.
+        channels (dict): Dictionary mapping channel indices to channel names.
+        sampling_rate (dict): Dictionary mapping channel indices to sampling rates.
+        output_dir (str): Directory to save the cleaned data.
+        eeg_channels (list): List of names for the EEG channels to be cleaned.
+        reference_channels (list): List of names for channels used as noise references.
+        lms_order (int): Order (number of taps) for the LMS filter.
+        lms_mu (float): Learning rate (step size) for the LMS filter.
+
+    Returns:
+        list: List of dictionaries containing patient data with adaptively filtered EEG signals.
+    """
+    # Determine if input data was normalized based on previous steps (heuristic)
+    # This is tricky, rely on a consistent naming convention if possible or pass explicitly.
+    # For now, assume no specific suffix needed unless derived from input file name.
+    # Consider adding a flag if normalization state needs to be strictly tracked.
+    processed_data_file = os.path.join(output_dir, f'adaptively_filtered_data_M{lms_order}_mu{lms_mu}.pkl')
+    
+    if os.path.exists(processed_data_file):
+        print(f"\nAdaptively filtered data file already exists at: {processed_data_file}")
+        print("Loading existing data instead of reprocessing.")
+        with open(processed_data_file, 'rb') as f:
+            adaptively_filtered_data = pickle.load(f)
+        return adaptively_filtered_data
+
+    print("\nApplying Adaptive Filtering (LMS)...")
+    adaptively_filtered_data_list = []
+
+    channel_map_inv = {v: k for k, v in channels.items()} # Map name back to index
+
+    # Process each patient
+    for patient_idx, patient_data in enumerate(input_data):
+        print(f" Processing patient {patient_idx + 1} with Adaptive Filtering...")
+        cleaned_patient_data = {}
+        
+        # --- Get data length and verify consistency ---
+        first_channel_name = next(iter(patient_data))
+        if not first_channel_name:
+            print(f"  Warning: Patient {patient_idx + 1} has no data. Skipping.")
+            adaptively_filtered_data_list.append({})
+            continue
+            
+        data_length = len(patient_data[first_channel_name])
+        consistent_length = True
+        for name, data in patient_data.items():
+            if len(data) != data_length:
+                print(f"  Warning: Inconsistent data lengths found for patient {patient_idx + 1}. Channel {name} has length {len(data)}, expected {data_length}. Skipping patient.")
+                consistent_length = False
+                break
+        if not consistent_length:
+            adaptively_filtered_data_list.append(patient_data) # Append original data if inconsistent
+            continue
+        
+        # --- Process Channels ---
+        # Copy non-EEG channels directly
+        for name, data in patient_data.items():
+            if name not in eeg_channels:
+                cleaned_patient_data[name] = data
+
+        # Apply adaptive filtering to EEG channels
+        for eeg_name in eeg_channels:
+            if eeg_name not in patient_data:
+                print(f"  Warning: EEG channel '{eeg_name}' not found for patient {patient_idx + 1}. Skipping.")
+                continue
+
+            print(f"  - Processing EEG channel: {eeg_name}")
+            current_eeg_signal = patient_data[eeg_name].copy() # Start with the original EEG
+
+            # Apply LMS sequentially for each reference channel
+            for ref_name in reference_channels:
+                if ref_name not in patient_data:
+                    print(f"    - Reference channel '{ref_name}' not found. Skipping this reference.")
+                    continue
+                
+                print(f"    - Using reference: {ref_name}")
+                reference_signal = patient_data[ref_name]
+
+                # Apply LMS: Use current EEG signal as desired, ref signal as noise input
+                try:
+                    cleaned_signal = lms_filter(current_eeg_signal, reference_signal, M=lms_order, mu=lms_mu)
+                    current_eeg_signal = cleaned_signal # Output of this stage is input for the next
+                except ValueError as e:
+                     print(f"    - Error applying LMS with reference {ref_name}: {e}. Using signal before this reference.")
+                     # Keep current_eeg_signal as it was before this failed reference
+
+            # Store the final cleaned EEG signal for this channel
+            cleaned_patient_data[eeg_name] = current_eeg_signal
+            print(f"  - Finished processing {eeg_name}")
+            
+        adaptively_filtered_data_list.append(cleaned_patient_data)
+
+    # Save the adaptively filtered data
+    print(f"\nSaving adaptively filtered data to {processed_data_file}")
+    with open(processed_data_file, 'wb') as f:
+        pickle.dump(adaptively_filtered_data_list, f)
+
+    return adaptively_filtered_data_list
 
 
 # Wavelet Decomposition
@@ -851,94 +1177,1061 @@ def extract_features(wavelet_data, spindle_results, channels, sampling_rate, out
 
     for subject_idx, subject_data in enumerate(wavelet_data):
         print(f" Extracting features for subject {subject_idx + 1}/{len(wavelet_data)}")
+        # Determine number of epochs from one of the channels (assuming same number across EEG channels)
+        num_epochs = 0
+        epoch_len_samples = 0
+        fs = 0
+        first_ch_key = None
         for ch_key in eeg_channel_keys:
             ch_name = channels[ch_key]
-            fs = sampling_rate[ch_key]
-            nperseg = int(welch_window_sec * fs)
+            if ch_name in subject_data and 'Original' in subject_data[ch_name] and subject_data[ch_name]['Original']:
+                num_epochs = len(subject_data[ch_name]['Original'])
+                epoch_len_samples = subject_data[ch_name]['Original'][0].shape[0]
+                fs = sampling_rate[ch_key]
+                first_ch_key = ch_key # Store the key we used to get epoch info
+                break # Found valid channel data, exit loop
 
-            if ch_name not in subject_data or 'Original' not in subject_data[ch_name]:
-                print(f"Warning: Original epoch data not found for {ch_name} in subject {subject_idx + 1}. Skipping.")
-                continue
+        if num_epochs == 0 or fs == 0 or first_ch_key is None:
+             print(f"Warning: Could not determine epoch information for subject {subject_idx + 1}. Skipping feature extraction for this subject.")
+             continue
+
+        epoch_duration_s = epoch_len_samples / fs
+
+        for epoch_idx in range(num_epochs):
+            # We'll compute features averaged across EEG channels for each epoch
+            epoch_features_agg = {} # To store aggregated features before adding subject/epoch info
+            channel_count = 0
+
+            for ch_key in eeg_channel_keys:
+                ch_name = channels[ch_key]
+                current_fs = sampling_rate[ch_key] # Use current channel's FS
+
+                # Check if data exists and fs matches the one used for epoch calculation
+                if ch_name not in subject_data or 'Original' not in subject_data[ch_name] or \
+                   len(subject_data[ch_name]['Original']) <= epoch_idx or current_fs != fs:
+                    # print(f"Debug: Skipping channel {ch_name} for epoch {epoch_idx+1} due to missing data or FS mismatch.")
+                    continue
                 
-            original_epochs = subject_data[ch_name]['Original']
-            if not original_epochs: # Check if list is empty
-                print(f"Warning: No original epochs found for {ch_name} in subject {subject_idx + 1}. Skipping channel.")
-                continue
-            num_epochs = len(original_epochs)
-            epoch_len_samples = original_epochs[0].shape[0] # Get shape from the first epoch
-            epoch_duration_s = epoch_len_samples / fs
+                epoch_signal = subject_data[ch_name]['Original'][epoch_idx]
+                if epoch_signal.shape[0] != epoch_len_samples:
+                    # print(f"Debug: Skipping channel {ch_name} for epoch {epoch_idx+1} due to length mismatch.")
+                    continue # Skip if length mismatches (shouldn't happen with create_epochs)
 
-            # Get corresponding spindle mask for the channel
-            subject_spindle_masks = spindle_results[subject_idx].get(ch_name, None)
-            if subject_spindle_masks is None:
-                 print(f"Warning: Spindle results not found for {ch_name} in subject {subject_idx + 1}. Spindle density will be NaN.")
-
-            for epoch_idx in range(num_epochs):
-                epoch_signal = original_epochs[epoch_idx]
-                features = {
-                    'Subject': subject_idx + 1,
-                    'Epoch': epoch_idx + 1,
-                    'Channel': ch_name
-                }
+                channel_count += 1
+                nperseg = int(welch_window_sec * current_fs)
 
                 # --- Basic Statistics ---
-                features['Mean'] = np.mean(epoch_signal)
-                features['Median'] = np.median(epoch_signal)
-                features['Variance'] = np.var(epoch_signal) # Same as Hjorth Activity
-                features['Skewness'] = skew(epoch_signal)
-                features['MeanAbsVal'] = np.mean(np.abs(epoch_signal))
+                epoch_features_agg['Mean'] = epoch_features_agg.get('Mean', 0) + np.mean(epoch_signal)
+                epoch_features_agg['Median'] = epoch_features_agg.get('Median', 0) + np.median(epoch_signal)
+                epoch_features_agg['Variance'] = epoch_features_agg.get('Variance', 0) + np.var(epoch_signal)
+                epoch_features_agg['Skewness'] = epoch_features_agg.get('Skewness', 0) + skew(epoch_signal)
+                epoch_features_agg['MeanAbsVal'] = epoch_features_agg.get('MeanAbsVal', 0) + np.mean(np.abs(epoch_signal))
 
                 # --- Spectral Features (using Welch's method) ---
-                freqs, psd = signal.welch(epoch_signal, fs=fs, nperseg=min(nperseg, epoch_len_samples), noverlap=nperseg // 2)
-                
-                # Absolute Power
+                freqs, psd = signal.welch(epoch_signal, fs=current_fs, nperseg=min(nperseg, epoch_len_samples), noverlap=nperseg // 2)
+
                 abs_power = {}
                 for band_name, band_limits in freq_bands.items():
-                    abs_power[band_name] = calculate_band_power(freqs, psd, band_limits)
-                    features[f'{band_name}_AbsPwr'] = abs_power[band_name]
-                
-                # Total Power
-                total_power = calculate_band_power(freqs, psd, total_power_range)
-                features['Total_AbsPwr'] = total_power
+                    power = calculate_band_power(freqs, psd, band_limits)
+                    abs_power[band_name] = power
+                    epoch_features_agg[f'{band_name}_AbsPwr'] = epoch_features_agg.get(f'{band_name}_AbsPwr', 0) + power
 
-                # Relative Power
+                total_power = calculate_band_power(freqs, psd, total_power_range)
+                epoch_features_agg['Total_AbsPwr'] = epoch_features_agg.get('Total_AbsPwr', 0) + total_power
+
                 for band_name, band_abs_power in abs_power.items():
-                    features[f'{band_name}_RelPwr'] = band_abs_power / total_power if total_power > 0 else 0
-                
-                # Other Spectral Features
-                spectral_calcs = calculate_spectral_features(freqs, psd, total_power, fs)
-                features.update(spectral_calcs)
+                     rel_power = band_abs_power / total_power if total_power > 0 else 0
+                     epoch_features_agg[f'{band_name}_RelPwr'] = epoch_features_agg.get(f'{band_name}_RelPwr', 0) + rel_power
+
+                spectral_calcs = calculate_spectral_features(freqs, psd, total_power, current_fs)
+                for key, value in spectral_calcs.items():
+                    epoch_features_agg[key] = epoch_features_agg.get(key, 0) + value
 
                 # --- Hjorth Parameters ---
                 hjorth_params = calculate_hjorth_parameters(epoch_signal)
-                features.update(hjorth_params)
+                for key, value in hjorth_params.items():
+                    epoch_features_agg[key] = epoch_features_agg.get(key, 0) + value
 
                 # --- Spindle Density ---
-                if subject_spindle_masks is not None:
+                # Spindle density is channel specific, average it too
+                subject_spindle_masks = spindle_results[subject_idx].get(ch_name, None)
+                if subject_spindle_masks is not None and len(subject_spindle_masks) > epoch_idx:
                     spindle_mask_epoch = subject_spindle_masks[epoch_idx]
                     num_spindles = count_spindles(spindle_mask_epoch)
-                    features['SpindleDensity'] = num_spindles / epoch_duration_s
-                else:
-                    features['SpindleDensity'] = np.nan
+                    density = num_spindles / epoch_duration_s
+                    epoch_features_agg['SpindleDensity'] = epoch_features_agg.get('SpindleDensity', 0) + density
+                elif 'SpindleDensity' not in epoch_features_agg: # Initialize if no channel has reported yet
+                    epoch_features_agg['SpindleDensity'] = 0
+
 
                 # --- Wavelet Band Statistics ---
-                for band_name in freq_bands.keys(): # Use same band names
-                    if band_name in subject_data[ch_name]:
+                for band_name in freq_bands.keys():
+                    if band_name in subject_data[ch_name] and len(subject_data[ch_name][band_name]) > epoch_idx:
                         band_signal_epoch = subject_data[ch_name][band_name][epoch_idx]
-                        features[f'{band_name}_Mean'] = np.mean(band_signal_epoch)
-                        features[f'{band_name}_Std'] = np.std(band_signal_epoch)
-                        features[f'{band_name}_Var'] = np.var(band_signal_epoch)
-                    else:
-                        # Handle case where a band might be missing from wavelet_data (unlikely)
-                        features[f'{band_name}_Mean'] = np.nan
-                        features[f'{band_name}_Std'] = np.nan
-                        features[f'{band_name}_Var'] = np.nan
+                        epoch_features_agg[f'{band_name}_Mean'] = epoch_features_agg.get(f'{band_name}_Mean', 0) + np.mean(band_signal_epoch)
+                        epoch_features_agg[f'{band_name}_Std'] = epoch_features_agg.get(f'{band_name}_Std', 0) + np.std(band_signal_epoch)
+                        epoch_features_agg[f'{band_name}_Var'] = epoch_features_agg.get(f'{band_name}_Var', 0) + np.var(band_signal_epoch)
+                    else: # Initialize if missing
+                        if f'{band_name}_Mean' not in epoch_features_agg: epoch_features_agg[f'{band_name}_Mean'] = 0
+                        if f'{band_name}_Std' not in epoch_features_agg: epoch_features_agg[f'{band_name}_Std'] = 0
+                        if f'{band_name}_Var' not in epoch_features_agg: epoch_features_agg[f'{band_name}_Var'] = 0
 
-                all_features.append(features)
+
+            # Average the aggregated features over the number of channels processed
+            if channel_count > 0:
+                final_epoch_features = {key: val / channel_count for key, val in epoch_features_agg.items()}
+                final_epoch_features['Subject'] = subject_idx + 1
+                final_epoch_features['Epoch'] = epoch_idx + 1
+                # Add a general 'EEG' channel label since we averaged
+                final_epoch_features['Channel'] = 'EEG_Avg'
+                all_features.append(final_epoch_features)
+            else:
+                print(f"Warning: No valid EEG channel data found for subject {subject_idx+1}, epoch {epoch_idx+1}. Skipping epoch.")
+
 
     features_df = pd.DataFrame(all_features)
     
     print(f"Saving features to {output_file}...")
+    # Ensure output directory exists
+    os.makedirs(output_dir, exist_ok=True)
     features_df.to_csv(output_file, index=False)
     
     return features_df
+
+
+def classify_sleep_stages(features_dataframe, xml_data, output_dir, test_size=0.3, random_state=42):
+    """
+    Trains an XGBoost classifier to predict sleep stages based on extracted features.
+
+    Args:
+        features_dataframe (pd.DataFrame): DataFrame containing features per epoch,
+                                           must include 'Subject' and 'Epoch' columns.
+                                           Assumes features are averaged across EEG channels ('EEG_Avg').
+        xml_data (list): List of dictionaries, where each dictionary contains XML data
+                         for a patient, including 'stages' (list of per-second stages)
+                         and 'epoch_length'. Index corresponds to subject_idx.
+        output_dir (str): Directory to save the trained model, label encoder, and results.
+        test_size (float): Proportion of the dataset to include in the validation split.
+        random_state (int): Seed for reproducibility of train/test split.
+
+    Returns:
+        tuple: (trained_model, label_encoder, evaluation_results)
+               - trained_model: The fitted XGBoost classifier.
+               - label_encoder: The fitted LabelEncoder for sleep stages.
+               - evaluation_results (dict): Dictionary containing accuracy, classification report,
+                                           and confusion matrix.
+    """
+    print("\\n--- Starting Sleep Stage Classification ---")
+    # Create output sub-directory for classification results
+    classification_output_dir = os.path.join(output_dir, 'classification')
+    os.makedirs(classification_output_dir, exist_ok=True)
+
+    # --- 1. Prepare Target Labels (Sleep Stages per Epoch) ---
+    print("Preparing target labels from XML data...")
+    epoch_labels = []
+    stage_mapping_rev = { # Reverse mapping from read_xml for easier interpretation
+        4: 'N1', 3: 'N2', 2: 'N3', 1: 'N4', 0: 'REM', 5: 'Wake'
+    }
+
+    for subject_idx, patient_xml in enumerate(xml_data):
+        subject_id = subject_idx + 1
+        if not patient_xml or 'stages' not in patient_xml or 'epoch_length' not in patient_xml:
+            print(f"Warning: Missing XML data for Subject {subject_id}. Skipping.")
+            continue
+
+        stages_per_second = patient_xml['stages']
+        epoch_length_sec = patient_xml['epoch_length']
+
+        if epoch_length_sec <= 0:
+             print(f"Warning: Invalid epoch length ({epoch_length_sec}) for Subject {subject_id}. Skipping.")
+             continue
+
+        num_epochs = len(stages_per_second) // epoch_length_sec
+
+        for epoch_idx in range(num_epochs):
+            epoch_start_sec = epoch_idx * epoch_length_sec
+            epoch_end_sec = epoch_start_sec + epoch_length_sec
+            epoch_sec_stages = stages_per_second[epoch_start_sec:epoch_end_sec]
+
+            if not epoch_sec_stages:
+                print(f"Warning: No stage data for Subject {subject_id}, Epoch {epoch_idx+1}. Skipping.")
+                continue
+
+            # Use the mode (most frequent stage) for the epoch label
+            mode_result = scipy_mode(epoch_sec_stages, keepdims=False) # Use keepdims=False for newer scipy
+            epoch_stage_numeric = mode_result.mode # Access mode value
+
+            # Map numeric stage back to string label using reverse mapping
+            epoch_stage_label = stage_mapping_rev.get(epoch_stage_numeric, f'Unknown_{epoch_stage_numeric}')
+
+            epoch_labels.append({
+                'Subject': subject_id,
+                'Epoch': epoch_idx + 1,
+                'Stage': epoch_stage_label
+            })
+
+    if not epoch_labels:
+        raise ValueError("No valid epoch labels could be generated from the XML data.")
+
+    labels_df = pd.DataFrame(epoch_labels)
+    print(f"Generated {len(labels_df)} epoch labels.")
+    print("Stage distribution in labels:\n", labels_df['Stage'].value_counts())
+
+    # --- 2. Merge Features and Labels ---
+    print("Merging features with labels...")
+    # Ensure Subject/Epoch are the correct type for merging
+    features_dataframe['Subject'] = features_dataframe['Subject'].astype(int)
+    features_dataframe['Epoch'] = features_dataframe['Epoch'].astype(int)
+    labels_df['Subject'] = labels_df['Subject'].astype(int)
+    labels_df['Epoch'] = labels_df['Epoch'].astype(int)
+
+    # Filter features to only include the averaged EEG channel if present
+    if 'EEG_Avg' in features_dataframe['Channel'].unique():
+         print("Filtering features for 'EEG_Avg' channel.")
+         features_to_merge = features_dataframe[features_dataframe['Channel'] == 'EEG_Avg'].copy()
+    else:
+         # If no averaged channel, we might have multiple rows per Subject/Epoch (one per EEG channel)
+         # For classification per epoch, we should average features here or select one channel.
+         # Averaging seems consistent with the modified feature extraction.
+         print("Warning: 'EEG_Avg' channel not found. Averaging features across available EEG channels per epoch.")
+         feature_cols = [col for col in features_dataframe.columns if col not in ['Subject', 'Epoch', 'Channel']]
+         features_to_merge = features_dataframe.groupby(['Subject', 'Epoch'])[feature_cols].mean().reset_index()
+         # Need to re-add a Channel column? Or proceed without it. Let's proceed without for now.
+
+    # Perform the merge
+    merged_data = pd.merge(features_to_merge, labels_df, on=['Subject', 'Epoch'], how='inner')
+
+    if merged_data.empty:
+        raise ValueError("Merging features and labels resulted in an empty DataFrame. Check Subject/Epoch alignment.")
+
+    print(f"Merged data shape: {merged_data.shape}")
+    print("Stage distribution after merge:\n", merged_data['Stage'].value_counts())
+
+
+    # --- 3. Prepare Data for XGBoost (X, y) ---
+    print("Preparing data for XGBoost...")
+    # Features (X): All columns except Subject, Epoch, Channel (if exists), and Stage
+    feature_columns = [col for col in merged_data.columns if col not in ['Subject', 'Epoch', 'Channel', 'Stage']]
+    X = merged_data[feature_columns]
+    y_labels = merged_data['Stage']
+
+    # Handle potential NaN/inf values in features (e.g., fill with mean or median)
+    if X.isnull().values.any():
+        print("Warning: NaN values found in features. Filling with column median.")
+        X = X.fillna(X.median())
+    if np.isinf(X.values).any():
+         print("Warning: Infinite values found in features. Replacing with large finite numbers.")
+         X = X.replace([np.inf, -np.inf], np.nan)
+         X = X.fillna(X.median()) # Fill NaNs created by replacement
+
+    # Encode target labels (y)
+    le = LabelEncoder()
+    y = le.fit_transform(y_labels)
+    print(f"Encoded labels: {dict(zip(le.classes_, le.transform(le.classes_)))}")
+
+    # Save the label encoder
+    encoder_path = os.path.join(classification_output_dir, 'label_encoder.joblib')
+    joblib.dump(le, encoder_path)
+    print(f"Label encoder saved to {encoder_path}")
+
+
+    # --- 4. Split Data ---
+    print(f"Splitting data into training ({1-test_size:.0%}) and validation ({test_size:.0%})...")
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y,
+        test_size=test_size,
+        random_state=random_state,
+        stratify=y  # Important for potentially imbalanced sleep stages
+    )
+    print(f"Train set shape: X={X_train.shape}, y={y_train.shape}")
+    print(f"Test set shape: X={X_test.shape}, y={y_test.shape}")
+
+
+    # --- 5. Train XGBoost Classifier ---
+    print("Training XGBoost classifier...")
+    num_classes = len(le.classes_)
+    model = xgb.XGBClassifier(
+        objective='multi:softmax',  # for multi-class classification
+        num_class=num_classes,
+        eval_metric='mlogloss',     # evaluation metric
+        use_label_encoder=False,    # Recommended for recent XGBoost versions
+        random_state=random_state
+    )
+
+    model.fit(X_train, y_train)
+    print("Training complete.")
+
+    # Save the trained model
+    model_path = os.path.join(classification_output_dir, 'xgboost_model.joblib')
+    joblib.dump(model, model_path)
+    print(f"Trained XGBoost model saved to {model_path}")
+
+
+    # --- 6. Evaluate Model ---
+    print("\\n--- Evaluating Model on Validation Set ---")
+    y_pred = model.predict(X_test)
+
+    # Calculate metrics
+    accuracy = accuracy_score(y_test, y_pred)
+    report = classification_report(y_test, y_pred, target_names=le.classes_, output_dict=True)
+    conf_matrix = confusion_matrix(y_test, y_pred)
+
+    print(f"Validation Accuracy: {accuracy:.4f}")
+    print("\\nClassification Report:")
+    # Pretty print report
+    report_df = pd.DataFrame(report).transpose()
+    print(report_df)
+
+    print("\\nConfusion Matrix:")
+    # Print confusion matrix with labels for clarity
+    conf_matrix_df = pd.DataFrame(conf_matrix, index=le.classes_, columns=le.classes_)
+    print(conf_matrix_df)
+
+    # Store results
+    evaluation_results = {
+        'accuracy': accuracy,
+        'classification_report': report,
+        'confusion_matrix': conf_matrix.tolist(), # Convert numpy array for saving if needed
+        'confusion_matrix_labels': le.classes_.tolist()
+    }
+
+    # Save evaluation results to a file
+    results_path = os.path.join(classification_output_dir, 'evaluation_results.pkl')
+    with open(results_path, 'wb') as f:
+        pickle.dump(evaluation_results, f)
+    print(f"Evaluation results saved to {results_path}")
+
+    return model, le, evaluation_results
+
+def plot_band_power_with_stages(wavelet_data, xml_data, channels, sampling_rate, output_dir, 
+                                subject_index, eeg_channel_name):
+    """Generates a plot showing EEG band power per epoch overlaid with the sleep hypnogram.
+
+    Args:
+        wavelet_data (list): Output from wavelet_decomposition.
+        xml_data (list): List of dictionaries containing patient XML data (stages, epoch_length).
+        channels (dict): Channel mapping dictionary.
+        sampling_rate (dict): Sampling rate dictionary.
+        output_dir (str): Base directory to save the plot.
+        subject_index (int): Index of the subject to plot (0-based).
+        eeg_channel_name (str): Name of the EEG channel to use for band power.
+    """
+    print(f"\\nGenerating band power and hypnogram plot for Subject {subject_index + 1}, Channel {eeg_channel_name}...")
+
+    # --- 1. Input Validation and Data Selection ---
+    if subject_index >= len(wavelet_data) or subject_index >= len(xml_data):
+        print(f"Error: Subject index {subject_index} is out of bounds.")
+        return
+        
+    subject_wavelet_data = wavelet_data[subject_index]
+    subject_xml_data = xml_data[subject_index]
+
+    if eeg_channel_name not in subject_wavelet_data:
+        print(f"Error: EEG channel '{eeg_channel_name}' not found in wavelet data for Subject {subject_index + 1}.")
+        return
+        
+    if not subject_xml_data or 'stages' not in subject_xml_data or 'epoch_length' not in subject_xml_data:
+        print(f"Error: Missing or incomplete XML data (stages/epoch_length) for Subject {subject_index + 1}.")
+        return
+        
+    # Find channel key for sampling rate
+    channel_key = None
+    for key, name in channels.items():
+        if name == eeg_channel_name:
+            channel_key = key
+            break
+    if channel_key is None:
+         print(f"Error: Could not find channel key for '{eeg_channel_name}'.")
+         return
+    fs = sampling_rate[channel_key]
+
+    # --- 2. Calculate Band Power per Epoch --- 
+    bands_to_plot = ['Delta', 'Theta', 'Alpha', 'Sigma', 'Beta', 'Gamma']
+    band_powers = {band: [] for band in bands_to_plot}
+    num_epochs = 0
+
+    if 'Original' in subject_wavelet_data[eeg_channel_name]:
+         num_epochs = len(subject_wavelet_data[eeg_channel_name]['Original'])
+    else:
+         print(f"Error: 'Original' epoch data missing for channel '{eeg_channel_name}'. Cannot determine number of epochs.")
+         return
+         
+    if num_epochs == 0:
+        print(f"Warning: No epochs found for channel '{eeg_channel_name}'. Cannot generate plot.")
+        return
+
+    print(f"  Calculating power for {num_epochs} epochs...")
+    for epoch_idx in range(num_epochs):
+        for band_name in bands_to_plot:
+            if band_name in subject_wavelet_data[eeg_channel_name] and len(subject_wavelet_data[eeg_channel_name][band_name]) > epoch_idx:
+                band_signal_epoch = subject_wavelet_data[eeg_channel_name][band_name][epoch_idx]
+                # Calculate power as variance
+                power = np.var(band_signal_epoch)
+                band_powers[band_name].append(power)
+            else:
+                # Append NaN or 0 if band data is missing for this epoch
+                band_powers[band_name].append(np.nan)
+                print(f"Warning: Missing wavelet data for band '{band_name}', epoch {epoch_idx+1}. Plotting as NaN.")
+
+    # Convert power lists to numpy arrays
+    for band_name in bands_to_plot:
+        band_powers[band_name] = np.array(band_powers[band_name])
+
+    # --- 3. Determine Sleep Stage per Epoch --- 
+    stages_per_second = subject_xml_data['stages']
+    epoch_length_sec = subject_xml_data['epoch_length']
+    num_epochs_xml = len(stages_per_second) // epoch_length_sec
+    
+    if num_epochs_xml != num_epochs:
+        print(f"Warning: Number of epochs mismatch between wavelet data ({num_epochs}) and XML data ({num_epochs_xml}). Truncating to minimum.")
+        num_epochs = min(num_epochs, num_epochs_xml)
+        # Trim band power arrays if needed
+        for band_name in bands_to_plot:
+            band_powers[band_name] = band_powers[band_name][:num_epochs]
+            
+    epoch_stages_numeric = []
+    for epoch_idx in range(num_epochs):
+        epoch_start_sec = epoch_idx * epoch_length_sec
+        epoch_end_sec = epoch_start_sec + epoch_length_sec
+        epoch_sec_stages = stages_per_second[epoch_start_sec:epoch_end_sec]
+        if not epoch_sec_stages:
+            epoch_stages_numeric.append(np.nan) # Use NaN for missing stages
+            continue
+        mode_result = scipy_mode(epoch_sec_stages, keepdims=False)
+        epoch_stages_numeric.append(mode_result.mode)
+        
+    epoch_stages_numeric = np.array(epoch_stages_numeric)
+
+    # --- 4. Plotting --- 
+    stage_mapping_rev = { # For labeling hypnogram
+        5: 'Wake', 4: 'N1', 3: 'N2', 2: 'N3', 1: 'N4', 0: 'REM'
+    }
+    stage_colors = { # Colors for hypnogram stages
+        5: 'orange', 4: 'yellow', 3: 'lightgreen', 2: 'lightblue', 1: 'blue', 0: 'red',
+        np.nan: 'grey' # Color for unknown/missing stages
+    }
+
+    epochs_time_axis = np.arange(num_epochs)
+
+    fig, ax1 = plt.subplots(figsize=(18, 8))
+    fig.suptitle(f'Subject {subject_index + 1} - {eeg_channel_name} - Band Power & Sleep Stages')
+
+    # Plot band powers on primary axis (ax1)
+    ax1.set_xlabel('Epoch Number')
+    ax1.set_ylabel('Log Band Power (Variance)', color='tab:blue')
+    ax1.tick_params(axis='y', labelcolor='tab:blue')
+    # Use log scale for power because it varies greatly between bands
+    # Add small epsilon to avoid log(0)
+    epsilon = 1e-9
+    for band_name in bands_to_plot:
+        ax1.plot(epochs_time_axis, np.log10(band_powers[band_name] + epsilon), label=f'{band_name} Log Power')
+    ax1.legend(loc='upper left')
+    ax1.grid(True, axis='y', linestyle='--', alpha=0.6)
+
+    # Create secondary axis for hypnogram (ax2)
+    ax2 = ax1.twinx()
+    ax2.set_ylabel('Sleep Stage', color='black')
+    ax2.tick_params(axis='y', labelcolor='black')
+
+    # Define hypnogram levels (reverse order for plotting: Wake highest, N4 lowest)
+    hypno_levels = {'Wake': 5, 'REM': 4, 'N1': 3, 'N2': 2, 'N3': 1, 'N4': 0}
+    hypno_levels_rev = {v: k for k,v in hypno_levels.items()} # map level back to name
+    # Map numeric stages to plotting levels
+    stage_plot_levels = np.full(num_epochs, np.nan) # Initialize with NaN
+    for num_stage, name in stage_mapping_rev.items():
+        level = hypno_levels.get(name, np.nan) # Get plot level, NaN if stage not in hypno_levels (e.g. N4 mapped to N3)
+        if name == 'N4': level = hypno_levels['N3'] # Map N4 to N3 level for plotting if N3 exists
+        stage_plot_levels[epoch_stages_numeric == num_stage] = level
+
+    # Plot hypnogram using step plot
+    ax2.step(epochs_time_axis, stage_plot_levels, where='mid', color='black', linewidth=1.5)
+    # Set y-axis limits and ticks for stages
+    ax2.set_ylim(-0.5, len(hypno_levels) - 0.5)
+    ax2.set_yticks(list(hypno_levels.values()))
+    ax2.set_yticklabels(list(hypno_levels.keys())) # Use names for ticks
+    # Optional: Fill areas between steps with color
+    #for stage_num, stage_name in stage_mapping_rev.items():
+    #     level = hypno_levels.get(stage_name, np.nan)
+    #     color = stage_colors.get(stage_num, 'grey')
+    #     ax2.fill_between(epochs_time_axis, stage_plot_levels, where=(stage_plot_levels==level), 
+    #                      step='mid', alpha=0.3, color=color)
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout
+
+    # --- 5. Save Plot --- 
+    plot_output_dir = os.path.join(output_dir, 'Figures', 'BandPower_Hypnograms')
+    os.makedirs(plot_output_dir, exist_ok=True)
+    plot_filename = os.path.join(plot_output_dir, f'subject_{subject_index + 1}_{eeg_channel_name}_bandpower_hypno.png')
+    
+    try:
+        plt.savefig(plot_filename)
+        print(f"  Plot saved to: {plot_filename}")
+    except Exception as e:
+        print(f"Error saving plot: {e}")
+    plt.close(fig) # Close the figure to free memory
+
+
+def generate_final_visualizations(features_dataframe, xml_data, model, label_encoder, evaluation_results, output_dir):
+    """Generates and saves final summary visualizations for the sleep stage classification.
+
+    Args:
+        features_dataframe (pd.DataFrame): DataFrame with extracted features per epoch.
+        xml_data (list): List of patient XML data dictionaries.
+        model (xgb.XGBClassifier): The trained XGBoost model.
+        label_encoder (LabelEncoder): The fitted LabelEncoder for stages.
+        evaluation_results (dict): Dictionary containing metrics like 'confusion_matrix'.
+        output_dir (str): Base directory to save the figures.
+    """
+    print("\\n--- Generating Final Visualizations ---")
+
+    # --- 0. Define Output Paths & Ensure Directories Exist ---
+    figures_base_dir = os.path.join(output_dir, 'Figures')
+    band_power_dir = os.path.join(figures_base_dir, 'BandPowerDistribution')
+    feature_imp_dir = os.path.join(figures_base_dir, 'FeatureImportance')
+    conf_matrix_dir = os.path.join(figures_base_dir, 'ConfusionMatrix')
+    spindle_dir = os.path.join(figures_base_dir, 'SpindleAnalysis')
+
+    os.makedirs(band_power_dir, exist_ok=True)
+    os.makedirs(feature_imp_dir, exist_ok=True)
+    os.makedirs(conf_matrix_dir, exist_ok=True)
+    os.makedirs(spindle_dir, exist_ok=True)
+
+    # --- 1. Prepare Merged Data with Stage Labels --- 
+    # (Similar logic to the beginning of classify_sleep_stages)
+    print("  Preparing data for visualization (merging features and labels)...")
+    epoch_labels = []
+    stage_mapping_rev = { # Reverse mapping from read_xml for easier interpretation
+        4: 'N1', 3: 'N2', 2: 'N3', 1: 'N4', 0: 'REM', 5: 'Wake'
+    }
+    for subject_idx, patient_xml in enumerate(xml_data):
+        subject_id = subject_idx + 1
+        if not patient_xml or 'stages' not in patient_xml or 'epoch_length' not in patient_xml:
+            continue # Skip if XML invalid
+        stages_per_second = patient_xml['stages']
+        epoch_length_sec = patient_xml['epoch_length']
+        if epoch_length_sec <= 0: continue
+        num_epochs = len(stages_per_second) // epoch_length_sec
+        for epoch_idx in range(num_epochs):
+            epoch_start_sec = epoch_idx * epoch_length_sec
+            epoch_end_sec = epoch_start_sec + epoch_length_sec
+            epoch_sec_stages = stages_per_second[epoch_start_sec:epoch_end_sec]
+            if not epoch_sec_stages: continue
+            mode_result = scipy_mode(epoch_sec_stages, keepdims=False)
+            epoch_stage_numeric = mode_result.mode
+            epoch_stage_label = stage_mapping_rev.get(epoch_stage_numeric, f'Unknown_{epoch_stage_numeric}')
+            epoch_labels.append({'Subject': subject_id, 'Epoch': epoch_idx + 1, 'Stage': epoch_stage_label})
+    
+    if not epoch_labels:
+        print("Error: No valid epoch labels found. Cannot generate visualizations.")
+        return
+    labels_df = pd.DataFrame(epoch_labels)
+
+    # Merge features (assuming 'EEG_Avg' or averaging was done before classification)
+    features_dataframe['Subject'] = features_dataframe['Subject'].astype(int)
+    features_dataframe['Epoch'] = features_dataframe['Epoch'].astype(int)
+    labels_df['Subject'] = labels_df['Subject'].astype(int)
+    labels_df['Epoch'] = labels_df['Epoch'].astype(int)
+
+    # Select the relevant feature rows (e.g., averaged)
+    if 'EEG_Avg' in features_dataframe['Channel'].unique():
+         features_to_merge = features_dataframe[features_dataframe['Channel'] == 'EEG_Avg'].copy()
+    else:
+         # Fallback: Average features if EEG_Avg is missing (should match classification input prep)
+         print("Warning: 'EEG_Avg' channel not found in features. Averaging for visualization.")
+         feature_cols_vis = [col for col in features_dataframe.columns if col not in ['Subject', 'Epoch', 'Channel']]
+         features_to_merge = features_dataframe.groupby(['Subject', 'Epoch'])[feature_cols_vis].mean().reset_index()
+
+    vis_data = pd.merge(features_to_merge, labels_df, on=['Subject', 'Epoch'], how='inner')
+
+    if vis_data.empty:
+        print("Error: Merged data for visualization is empty. Cannot proceed.")
+        return
+        
+    # Ensure stage order for plotting consistency if possible
+    stage_order = [s for s in ['Wake', 'N1', 'N2', 'N3', 'REM'] if s in vis_data['Stage'].unique()]
+    # Handle N4 potentially mapped to N3 during labeling
+    if 'N4' in stage_mapping_rev.values() and 'N4' not in stage_order and 'N3' in stage_order: 
+        pass # Assume N4 was mapped to N3 if N4 exists in mapping but not data
+    elif 'N4' in vis_data['Stage'].unique():
+        stage_order.insert(stage_order.index('N3')+1 if 'N3' in stage_order else len(stage_order), 'N4')
+        
+    print(f"  Data prepared for plotting (shape: {vis_data.shape}). Stage order: {stage_order}")
+    
+    # Add necessary imports if they aren't global
+    import matplotlib.pyplot as plt
+    import seaborn as sns 
+
+    # --- 2. Band Power Distribution by Stage ---
+    print("  Generating Band Power Distribution plot...")
+    band_power_cols = [col for col in vis_data.columns if '_AbsPwr' in col and 'Total' not in col]
+    if band_power_cols:
+        n_bands = len(band_power_cols)
+        n_cols_plot = 3
+        n_rows_plot = (n_bands + n_cols_plot - 1) // n_cols_plot
+        fig_bp, axes_bp = plt.subplots(n_rows_plot, n_cols_plot, figsize=(6 * n_cols_plot, 5 * n_rows_plot), sharey=True)
+        axes_bp = axes_bp.flatten() # Flatten for easy iteration
+
+        for i, bp_col in enumerate(band_power_cols):
+            band_name = bp_col.replace('_AbsPwr', '')
+            # Log transform power for visualization (handle zeros/negatives)
+            log_power = np.log10(vis_data[bp_col].clip(1e-9)) # Clip to avoid log(0)
+            sns.boxplot(ax=axes_bp[i], x='Stage', y=log_power, data=vis_data, order=stage_order, showfliers=False)
+            axes_bp[i].set_title(f'{band_name} Power Distribution')
+            axes_bp[i].set_ylabel('Log10(Absolute Power)')
+            axes_bp[i].set_xlabel('Sleep Stage')
+            axes_bp[i].tick_params(axis='x', rotation=45)
+            
+        # Hide unused subplots
+        for j in range(i + 1, len(axes_bp)):
+             fig_bp.delaxes(axes_bp[j])
+
+        plt.tight_layout()
+        plot_path = os.path.join(band_power_dir, 'band_power_distribution_by_stage.png')
+        try:
+            plt.savefig(plot_path)
+            print(f"    Saved plot: {plot_path}")
+        except Exception as e:
+            print(f"Error saving band power plot: {e}")
+        plt.close(fig_bp)
+    else:
+        print("    Skipping band power plot: No absolute power columns found.")
+
+    # --- 3. Feature Importance ---
+    print("  Generating Feature Importance plot...")
+    try:
+        feature_names = model.get_booster().feature_names
+        importances = model.feature_importances_
+        
+        importance_df = pd.DataFrame({'Feature': feature_names, 'Importance': importances})
+        importance_df = importance_df.sort_values(by='Importance', ascending=False)
+
+        # Plot top N features (e.g., top 30)
+        top_n = min(30, len(importance_df))
+        plt.figure(figsize=(10, top_n * 0.3))
+        sns.barplot(x='Importance', y='Feature', data=importance_df.head(top_n), palette='viridis')
+        plt.title(f'Top {top_n} Feature Importances (XGBoost)')
+        plt.tight_layout()
+        plot_path = os.path.join(feature_imp_dir, 'feature_importances.png')
+        plt.savefig(plot_path)
+        print(f"    Saved plot: {plot_path}")
+        plt.close()
+    except Exception as e:
+        print(f"    Error generating feature importance plot: {e}")
+
+    # --- 4. Confusion Matrix Heatmap ---
+    print("  Generating Confusion Matrix heatmap...")
+    if 'confusion_matrix' in evaluation_results:
+        conf_matrix = np.array(evaluation_results['confusion_matrix'])
+        class_names = label_encoder.classes_
+
+        # Normalize for better color comparison if desired
+        conf_matrix_norm = conf_matrix.astype('float') / conf_matrix.sum(axis=1)[:, np.newaxis]
+        conf_matrix_norm = np.nan_to_num(conf_matrix_norm) # handle potential division by zero
+        
+        fig_cm, ax_cm = plt.subplots(1, 2, figsize=(18, 7))
+        fig_cm.suptitle('Confusion Matrix')
+
+        # Plot raw counts
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=class_names, yticklabels=class_names, ax=ax_cm[0])
+        ax_cm[0].set_title('Counts')
+        ax_cm[0].set_xlabel('Predicted Label')
+        ax_cm[0].set_ylabel('True Label')
+
+        # Plot normalized percentages
+        sns.heatmap(conf_matrix_norm, annot=True, fmt='.2%', cmap='Blues', 
+                    xticklabels=class_names, yticklabels=class_names, ax=ax_cm[1])
+        ax_cm[1].set_title('Normalized by True Label')
+        ax_cm[1].set_xlabel('Predicted Label')
+        ax_cm[1].set_ylabel('True Label')
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plot_path = os.path.join(conf_matrix_dir, 'confusion_matrix_heatmap.png')
+        try:
+            plt.savefig(plot_path)
+            print(f"    Saved plot: {plot_path}")
+        except Exception as e:
+            print(f"Error saving confusion matrix plot: {e}")
+        plt.close(fig_cm)
+    else:
+        print("    Skipping confusion matrix plot: 'confusion_matrix' not found in evaluation_results.")
+
+    # --- 5. Spindle Density Distribution by Stage ---
+    print("  Generating Spindle Density Distribution plot...")
+    if 'SpindleDensity' in vis_data.columns:
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(x='Stage', y='SpindleDensity', data=vis_data, order=stage_order, showfliers=False)
+        # sns.violinplot(x='Stage', y='SpindleDensity', data=vis_data, order=stage_order, inner='quartile') # Alternative
+        plt.title('Spindle Density Distribution by Sleep Stage')
+        plt.xlabel('Sleep Stage')
+        plt.ylabel('Spindle Density (spindles/second)')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        plot_path = os.path.join(spindle_dir, 'spindle_density_distribution_by_stage.png')
+        try:
+            plt.savefig(plot_path)
+            print(f"    Saved plot: {plot_path}")
+        except Exception as e:
+            print(f"Error saving spindle density plot: {e}")
+        plt.close()
+    else:
+        print("    Skipping spindle density plot: 'SpindleDensity' column not found.")
+
+    print("--- Finished Generating Final Visualizations ---")
+
+def classify_sleep_stages_nn(features_dataframe, xml_data, output_dir, test_size=0.3, random_state=42):
+    """
+    Trains a Neural Network classifier (TensorFlow/Keras) to predict sleep stages.
+
+    Args:
+        features_dataframe (pd.DataFrame): DataFrame containing features per epoch.
+        xml_data (list): List of patient XML data dictionaries.
+        output_dir (str): Directory to save the model, encoder, scaler, and results.
+        test_size (float): Proportion of the dataset for the validation split.
+        random_state (int): Seed for reproducibility.
+
+    Returns:
+        tuple: (trained_model, label_encoder, scaler, evaluation_results)
+               - trained_model: The fitted Keras model.
+               - label_encoder: The fitted LabelEncoder for sleep stages.
+               - scaler: The fitted StandardScaler for features.
+               - evaluation_results (dict): Dictionary with accuracy, report, confusion matrix.
+    """
+    print("\\n--- Starting Sleep Stage Classification (Neural Network) ---")
+
+    # Create output sub-directory for NN classification results
+    classification_output_dir = os.path.join(output_dir, 'classification_nn')
+    os.makedirs(classification_output_dir, exist_ok=True)
+
+    # --- 1. Prepare Target Labels (Same as XGBoost version) ---
+    print("Preparing target labels from XML data...")
+    # (This part is identical to the XGBoost function - reusing logic)
+    epoch_labels = []
+    stage_mapping_rev = { 4: 'N1', 3: 'N2', 2: 'N3', 1: 'N4', 0: 'REM', 5: 'Wake'}
+    for subject_idx, patient_xml in enumerate(xml_data):
+        subject_id = subject_idx + 1
+        if not patient_xml or 'stages' not in patient_xml or 'epoch_length' not in patient_xml:
+            continue
+        stages_per_second = patient_xml['stages']
+        epoch_length_sec = patient_xml['epoch_length']
+        if epoch_length_sec <= 0: continue
+        num_epochs = len(stages_per_second) // epoch_length_sec
+        for epoch_idx in range(num_epochs):
+            epoch_start_sec = epoch_idx * epoch_length_sec
+            epoch_end_sec = epoch_start_sec + epoch_length_sec
+            epoch_sec_stages = stages_per_second[epoch_start_sec:epoch_end_sec]
+            if not epoch_sec_stages: continue
+            mode_result = scipy_mode(epoch_sec_stages, keepdims=False) 
+            epoch_stage_numeric = mode_result.mode
+            epoch_stage_label = stage_mapping_rev.get(epoch_stage_numeric, f'Unknown_{epoch_stage_numeric}')
+            epoch_labels.append({'Subject': subject_id, 'Epoch': epoch_idx + 1, 'Stage': epoch_stage_label})
+    if not epoch_labels: raise ValueError("No valid epoch labels could be generated.")
+    labels_df = pd.DataFrame(epoch_labels)
+    print(f"Generated {len(labels_df)} epoch labels.")
+
+    # --- 2. Merge Features and Labels --- 
+    print("Merging features with labels...")
+    # (Identical merging logic as XGBoost version)
+    features_dataframe['Subject'] = features_dataframe['Subject'].astype(int)
+    features_dataframe['Epoch'] = features_dataframe['Epoch'].astype(int)
+    labels_df['Subject'] = labels_df['Subject'].astype(int)
+    labels_df['Epoch'] = labels_df['Epoch'].astype(int)
+    if 'EEG_Avg' in features_dataframe['Channel'].unique():
+         features_to_merge = features_dataframe[features_dataframe['Channel'] == 'EEG_Avg'].copy()
+    else:
+         print("Warning: 'EEG_Avg' channel not found. Averaging features across EEG channels.")
+         feature_cols = [col for col in features_dataframe.columns if col not in ['Subject', 'Epoch', 'Channel']]
+         features_to_merge = features_dataframe.groupby(['Subject', 'Epoch'])[feature_cols].mean().reset_index()
+    merged_data = pd.merge(features_to_merge, labels_df, on=['Subject', 'Epoch'], how='inner')
+    if merged_data.empty: raise ValueError("Merging features and labels resulted in an empty DataFrame.")
+    print(f"Merged data shape: {merged_data.shape}")
+
+    # --- 3. Prepare Data for Neural Network --- 
+    print("Preparing data for Neural Network (Scaling, Encoding)...")
+    feature_columns = [col for col in merged_data.columns if col not in ['Subject', 'Epoch', 'Channel', 'Stage']]
+    X = merged_data[feature_columns]
+    y_labels = merged_data['Stage']
+
+    # Handle potential NaN/inf values (important before scaling)
+    if X.isnull().values.any():
+        print("Warning: NaN values found in features. Filling with column median.")
+        X = X.fillna(X.median())
+    if np.isinf(X.values).any():
+         print("Warning: Infinite values found in features. Replacing with large finite numbers and filling NaNs.")
+         X = X.replace([np.inf, -np.inf], np.nan)
+         X = X.fillna(X.median()) # Fill NaNs created by replacement or original NaNs
+
+    # Scale Features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    print(f"Features scaled using StandardScaler. Shape: {X_scaled.shape}")
+    
+    # Save the scaler
+    scaler_path = os.path.join(classification_output_dir, 'feature_scaler.joblib')
+    joblib.dump(scaler, scaler_path)
+    print(f"Feature scaler saved to {scaler_path}")
+
+    # Encode Labels
+    le = LabelEncoder()
+    y_encoded = le.fit_transform(y_labels)
+    num_classes = len(le.classes_)
+    print(f"Encoded labels: {dict(zip(le.classes_, le.transform(le.classes_)))}")
+    
+    # Convert labels to one-hot encoding for Keras
+    y_one_hot = tf.keras.utils.to_categorical(y_encoded, num_classes=num_classes)
+    print(f"Labels converted to one-hot encoding. Shape: {y_one_hot.shape}")
+
+    # Save the label encoder
+    encoder_path = os.path.join(classification_output_dir, 'label_encoder.joblib')
+    joblib.dump(le, encoder_path)
+    print(f"Label encoder saved to {encoder_path}")
+
+    # --- 4. Split Data --- 
+    print(f"Splitting data into training ({1-test_size:.0%}) and validation ({test_size:.0%})...")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_scaled, y_one_hot, 
+        test_size=test_size, 
+        random_state=random_state, 
+        stratify=y_encoded # Stratify based on original encoded labels before one-hot
+    )
+    print(f"Train set shape: X={X_train.shape}, y={y_train.shape}")
+    print(f"Validation set shape: X={X_val.shape}, y={y_val.shape}")
+
+    # --- 5. Define Keras Model --- 
+    print("Defining Keras Sequential model...")
+    input_shape = (X_train.shape[1],)
+    
+    model = keras.Sequential(
+        [
+            keras.Input(shape=input_shape),
+            layers.Dense(128, activation="relu"),
+            layers.Dropout(0.3),
+            layers.Dense(64, activation="relu"),
+            layers.Dropout(0.3),
+            layers.Dense(num_classes, activation="softmax"),
+        ]
+    )
+    model.summary()
+
+    # --- 6. Compile Model --- 
+    print("Compiling model...")
+    model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
+
+    # --- 7. Train Model --- 
+    print("Training Neural Network model...")
+    batch_size = 64
+    epochs = 100 # Max epochs, EarlyStopping will likely stop it sooner
+    
+    # Define callbacks
+    model_checkpoint_path = os.path.join(classification_output_dir, 'best_nn_model.keras') # Use .keras format
+    callbacks = [
+        EarlyStopping(monitor="val_loss", patience=10, verbose=1, restore_best_weights=False), # Restore_best_weights handled by loading saved model
+        ModelCheckpoint(filepath=model_checkpoint_path, monitor='val_loss', save_best_only=True, verbose=1)
+    ]
+
+    history = model.fit(
+        X_train, y_train,
+        batch_size=batch_size,
+        epochs=epochs,
+        callbacks=callbacks,
+        validation_data=(X_val, y_val),
+        verbose=2 # Set verbosity level (0=silent, 1=progress bar, 2=one line per epoch)
+    )
+    
+    print("Training complete.")
+
+    # --- 8. Load Best Model & Evaluate --- 
+    print("Loading best model saved during training...")
+    try:
+        best_model = tf.keras.models.load_model(model_checkpoint_path)
+        print(f"Best model loaded from {model_checkpoint_path}")
+    except Exception as e:
+        print(f"Error loading saved model: {e}. Using the model from the end of training.")
+        best_model = model # Fallback to the model at the end of training
+
+    print("\\n--- Evaluating Best Model on Validation Set ---")
+    # Get predictions (probabilities)
+    y_pred_proba = best_model.predict(X_val)
+    # Convert probabilities to class indices
+    y_pred_indices = np.argmax(y_pred_proba, axis=1)
+    # Convert true one-hot labels back to class indices
+    y_true_indices = np.argmax(y_val, axis=1)
+
+    # Calculate metrics
+    accuracy = accuracy_score(y_true_indices, y_pred_indices)
+    report = classification_report(y_true_indices, y_pred_indices, target_names=le.classes_, output_dict=True)
+    conf_matrix = confusion_matrix(y_true_indices, y_pred_indices)
+
+    print(f"Validation Accuracy: {accuracy:.4f}")
+    print("\\nClassification Report:")
+    report_df = pd.DataFrame(report).transpose()
+    print(report_df)
+    print("\\nConfusion Matrix:")
+    conf_matrix_df = pd.DataFrame(conf_matrix, index=le.classes_, columns=le.classes_)
+    print(conf_matrix_df)
+
+    # Store results
+    evaluation_results = {
+        'accuracy': accuracy,
+        'classification_report': report,
+        'confusion_matrix': conf_matrix.tolist(),
+        'confusion_matrix_labels': le.classes_.tolist()
+    }
+    results_path = os.path.join(classification_output_dir, 'evaluation_results.pkl')
+    with open(results_path, 'wb') as f:
+        pickle.dump(evaluation_results, f)
+    print(f"Evaluation results saved to {results_path}")
+
+    # --- 9. Return --- 
+    # Note: The saved model is separate, we return the loaded best model object
+    return best_model, le, scaler, evaluation_results
+
+def generate_final_visualizations_nn(features_dataframe, xml_data, label_encoder, evaluation_results, output_dir):
+    """Generates and saves final summary visualizations for Neural Network classification.
+
+    Args:
+        features_dataframe (pd.DataFrame): DataFrame with extracted features per epoch.
+        xml_data (list): List of patient XML data dictionaries.
+        label_encoder (LabelEncoder): The fitted LabelEncoder for stages.
+        evaluation_results (dict): Dictionary containing metrics like 'confusion_matrix'.
+        output_dir (str): Base directory to save the figures.
+    """
+    print("\\n--- Generating Final Visualizations (Neural Network) ---")
+
+    # --- 0. Define Output Paths & Ensure Directories Exist ---
+    # Save NN plots in a separate subdirectory to avoid overwriting XGBoost ones
+    figures_base_dir = os.path.join(output_dir, 'Figures_NN') # Changed base directory
+    band_power_dir = os.path.join(figures_base_dir, 'BandPowerDistribution')
+    conf_matrix_dir = os.path.join(figures_base_dir, 'ConfusionMatrix')
+    spindle_dir = os.path.join(figures_base_dir, 'SpindleAnalysis')
+
+    os.makedirs(figures_base_dir, exist_ok=True)
+    os.makedirs(band_power_dir, exist_ok=True)
+    os.makedirs(conf_matrix_dir, exist_ok=True)
+    os.makedirs(spindle_dir, exist_ok=True)
+
+    # --- 1. Prepare Merged Data with Stage Labels --- 
+    # (Identical logic to the previous visualization function)
+    print("  Preparing data for visualization (merging features and labels)...")
+    epoch_labels = []
+    stage_mapping_rev = { 4: 'N1', 3: 'N2', 2: 'N3', 1: 'N4', 0: 'REM', 5: 'Wake'}
+    for subject_idx, patient_xml in enumerate(xml_data):
+        subject_id = subject_idx + 1
+        if not patient_xml or 'stages' not in patient_xml or 'epoch_length' not in patient_xml: continue
+        stages_per_second = patient_xml['stages']
+        epoch_length_sec = patient_xml['epoch_length']
+        if epoch_length_sec <= 0: continue
+        num_epochs = len(stages_per_second) // epoch_length_sec
+        for epoch_idx in range(num_epochs):
+            epoch_start_sec = epoch_idx * epoch_length_sec
+            epoch_end_sec = epoch_start_sec + epoch_length_sec
+            epoch_sec_stages = stages_per_second[epoch_start_sec:epoch_end_sec]
+            if not epoch_sec_stages: continue
+            mode_result = scipy_mode(epoch_sec_stages, keepdims=False)
+            epoch_stage_numeric = mode_result.mode
+            epoch_stage_label = stage_mapping_rev.get(epoch_stage_numeric, f'Unknown_{epoch_stage_numeric}')
+            epoch_labels.append({'Subject': subject_id, 'Epoch': epoch_idx + 1, 'Stage': epoch_stage_label})
+    if not epoch_labels: 
+        print("Error: No valid epoch labels found. Cannot generate visualizations.")
+        return
+    labels_df = pd.DataFrame(epoch_labels)
+
+    features_dataframe['Subject'] = features_dataframe['Subject'].astype(int)
+    features_dataframe['Epoch'] = features_dataframe['Epoch'].astype(int)
+    labels_df['Subject'] = labels_df['Subject'].astype(int)
+    labels_df['Epoch'] = labels_df['Epoch'].astype(int)
+
+    if 'EEG_Avg' in features_dataframe['Channel'].unique():
+         features_to_merge = features_dataframe[features_dataframe['Channel'] == 'EEG_Avg'].copy()
+    else:
+         print("Warning: 'EEG_Avg' channel not found in features. Averaging for visualization.")
+         feature_cols_vis = [col for col in features_dataframe.columns if col not in ['Subject', 'Epoch', 'Channel']]
+         features_to_merge = features_dataframe.groupby(['Subject', 'Epoch'])[feature_cols_vis].mean().reset_index()
+
+    vis_data = pd.merge(features_to_merge, labels_df, on=['Subject', 'Epoch'], how='inner')
+    if vis_data.empty: 
+        print("Error: Merged data for visualization is empty. Cannot proceed.")
+        return
+        
+    stage_order = [s for s in ['Wake', 'N1', 'N2', 'N3', 'REM'] if s in vis_data['Stage'].unique()]
+    if 'N4' in stage_mapping_rev.values() and 'N4' not in stage_order and 'N3' in stage_order: pass
+    elif 'N4' in vis_data['Stage'].unique():
+        stage_order.insert(stage_order.index('N3')+1 if 'N3' in stage_order else len(stage_order), 'N4')
+    print(f"  Data prepared for plotting (shape: {vis_data.shape}). Stage order: {stage_order}")
+    
+    # Add necessary imports if they aren't global
+    import matplotlib.pyplot as plt
+    import seaborn as sns 
+    import numpy as np # Ensure numpy is available
+
+    # --- 2. Band Power Distribution by Stage ---
+    # (Identical to previous visualization function)
+    print("  Generating Band Power Distribution plot...")
+    band_power_cols = [col for col in vis_data.columns if '_AbsPwr' in col and 'Total' not in col]
+    if band_power_cols:
+        n_bands = len(band_power_cols)
+        n_cols_plot = 3
+        n_rows_plot = (n_bands + n_cols_plot - 1) // n_cols_plot
+        fig_bp, axes_bp = plt.subplots(n_rows_plot, n_cols_plot, figsize=(6 * n_cols_plot, 5 * n_rows_plot), sharey=True)
+        axes_bp = axes_bp.flatten()
+        for i, bp_col in enumerate(band_power_cols):
+            band_name = bp_col.replace('_AbsPwr', '')
+            log_power = np.log10(vis_data[bp_col].clip(1e-9))
+            sns.boxplot(ax=axes_bp[i], x='Stage', y=log_power, data=vis_data, order=stage_order, showfliers=False)
+            axes_bp[i].set_title(f'{band_name} Power Distribution')
+            axes_bp[i].set_ylabel('Log10(Absolute Power)')
+            axes_bp[i].set_xlabel('Sleep Stage')
+            axes_bp[i].tick_params(axis='x', rotation=45)
+        for j in range(i + 1, len(axes_bp)):
+             fig_bp.delaxes(axes_bp[j])
+        plt.tight_layout()
+        plot_path = os.path.join(band_power_dir, 'band_power_distribution_by_stage_nn.png') # Added suffix
+        try: plt.savefig(plot_path); print(f"    Saved plot: {plot_path}")
+        except Exception as e: print(f"Error saving band power plot: {e}")
+        plt.close(fig_bp)
+    else:
+        print("    Skipping band power plot: No absolute power columns found.")
+
+    # --- 3. Feature Importance (Omitted for NN) ---
+    print("  Skipping Feature Importance plot (not directly available for this Keras model).")
+    # Consider implementing permutation importance or SHAP if needed, requires extra libraries/computation.
+
+    # --- 4. Confusion Matrix Heatmap ---
+    # (Identical to previous visualization function)
+    print("  Generating Confusion Matrix heatmap...")
+    if 'confusion_matrix' in evaluation_results:
+        conf_matrix = np.array(evaluation_results['confusion_matrix'])
+        class_names = label_encoder.classes_
+        conf_matrix_norm = conf_matrix.astype('float') / conf_matrix.sum(axis=1)[:, np.newaxis]
+        conf_matrix_norm = np.nan_to_num(conf_matrix_norm)
+        fig_cm, ax_cm = plt.subplots(1, 2, figsize=(18, 7))
+        fig_cm.suptitle('Confusion Matrix (Neural Network)') # Added NN label
+        sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', xticklabels=class_names, yticklabels=class_names, ax=ax_cm[0])
+        ax_cm[0].set_title('Counts'); ax_cm[0].set_xlabel('Predicted Label'); ax_cm[0].set_ylabel('True Label')
+        sns.heatmap(conf_matrix_norm, annot=True, fmt='.2%', cmap='Blues', xticklabels=class_names, yticklabels=class_names, ax=ax_cm[1])
+        ax_cm[1].set_title('Normalized by True Label'); ax_cm[1].set_xlabel('Predicted Label'); ax_cm[1].set_ylabel('True Label')
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plot_path = os.path.join(conf_matrix_dir, 'confusion_matrix_heatmap_nn.png') # Added suffix
+        try: plt.savefig(plot_path); print(f"    Saved plot: {plot_path}")
+        except Exception as e: print(f"Error saving confusion matrix plot: {e}")
+        plt.close(fig_cm)
+    else:
+        print("    Skipping confusion matrix plot: 'confusion_matrix' not found.")
+
+    # --- 5. Spindle Density Distribution by Stage ---
+    # (Identical to previous visualization function)
+    print("  Generating Spindle Density Distribution plot...")
+    if 'SpindleDensity' in vis_data.columns:
+        plt.figure(figsize=(10, 6))
+        sns.boxplot(x='Stage', y='SpindleDensity', data=vis_data, order=stage_order, showfliers=False)
+        plt.title('Spindle Density Distribution by Sleep Stage')
+        plt.xlabel('Sleep Stage'); plt.ylabel('Spindle Density (spindles/second)')
+        plt.xticks(rotation=45); plt.tight_layout()
+        plot_path = os.path.join(spindle_dir, 'spindle_density_distribution_by_stage_nn.png') # Added suffix
+        try: plt.savefig(plot_path); print(f"    Saved plot: {plot_path}")
+        except Exception as e: print(f"Error saving spindle density plot: {e}")
+        plt.close()
+    else:
+        print("    Skipping spindle density plot: 'SpindleDensity' column not found.")
+
+    print("--- Finished Generating Final Visualizations (Neural Network) ---")
