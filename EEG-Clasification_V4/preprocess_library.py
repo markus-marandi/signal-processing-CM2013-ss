@@ -37,10 +37,8 @@ def load_patient_data(num_patients, base_input_dir, channels_dict, output_dir):
         tuple: A tuple containing:
             - list: List of dictionaries, where each dictionary holds the raw
                     channel data for one patient (keys are channel names, values are numpy arrays).
-                    Empty dictionaries are appended for patients with loading errors.
             - list: List of dictionaries, where each dictionary holds the XML
                     data (events, stages, etc.) for one patient.
-                    Empty dictionaries are appended for patients with loading errors.
     """
     # Define cache file paths
     raw_data_cache_path = os.path.join(output_dir, 'raw_data_list.pkl')
@@ -49,26 +47,21 @@ def load_patient_data(num_patients, base_input_dir, channels_dict, output_dir):
     # Check if cached data exists
     if os.path.exists(raw_data_cache_path) and os.path.exists(xml_data_cache_path):
         print(f"Loading raw and XML data from cache files in {output_dir}...")
-        try:
-            with open(raw_data_cache_path, 'rb') as f:
-                raw_data_list = pickle.load(f)
-            with open(xml_data_cache_path, 'rb') as f:
-                xml_data_list = pickle.load(f)
-            print("Successfully loaded data from cache.")
-            # Perform a basic sanity check (e.g., check length)
-            if len(raw_data_list) == num_patients and len(xml_data_list) == num_patients:
-                 print(f"Cache contains data for {len(raw_data_list)} patients.")
-                 return raw_data_list, xml_data_list
-            else:
-                 print(f"Warning: Cache data length mismatch (expected {num_patients}, found {len(raw_data_list)}). Reloading data.")
-                 # Reset lists to proceed with loading
-                 raw_data_list = []
-                 xml_data_list = []
-        except Exception as e:
-            print(f"Error loading data from cache: {e}. Proceeding to load from source files.")
-            # Reset lists in case of partial load failure
-            raw_data_list = []
-            xml_data_list = []
+        # Load directly, assuming cache files are valid if they exist
+        with open(raw_data_cache_path, 'rb') as f:
+            raw_data_list = pickle.load(f)
+        with open(xml_data_cache_path, 'rb') as f:
+            xml_data_list = pickle.load(f)
+        print("Successfully loaded data from cache.")
+        # Perform a basic sanity check (e.g., check length)
+        if len(raw_data_list) == num_patients and len(xml_data_list) == num_patients:
+             print(f"Cache contains data for {len(raw_data_list)} patients.")
+             return raw_data_list, xml_data_list
+        else:
+             print(f"Warning: Cache data length mismatch (expected {num_patients}, found {len(raw_data_list)}). Reloading data.")
+             # Reset lists to proceed with loading
+             raw_data_list = []
+             xml_data_list = []
     else:
         print("Cache files not found. Loading data from source EDF and XML files...")
         # Initialize lists if cache doesn't exist or loading failed
@@ -89,44 +82,21 @@ def load_patient_data(num_patients, base_input_dir, channels_dict, output_dir):
             edf_path = os.path.join(base_input_dir, f"R{k}.edf")
             xml_path = os.path.join(base_input_dir, f"R{k}.xml")
 
-            raw = None # Initialize raw to None for cleanup in except blocks
+            raw = None # Initialize raw to None for cleanup
             raw_picked = None # Initialize for cleanup
 
             # Load EDF data using MNE
             print(f"Loading EDF: {edf_path}")
-            try:
-                # Reduce MNE verbosity during loading
-                # Import mne here if not imported globally or pass it as an argument
-                import mne
-                raw = mne.io.read_raw_edf(edf_path, preload=True, verbose='WARNING')
-            except FileNotFoundError:
-                print(f"Error: EDF file not found at {edf_path}. Skipping patient {k}.")
-                raw_data_list.append({})
-                xml_data_list.append({})
-                continue # Skip to the next patient
-            except Exception as e: # Catch other potential MNE errors
-                    print(f"Error loading EDF file {edf_path}: {e}. Skipping patient {k}.")
-                    raw_data_list.append({})
-                    xml_data_list.append({})
-                    continue
+            # Reduce MNE verbosity during loading
+            # Import mne here if not imported globally or pass it as an argument
+            import mne
+            # Assume file exists and is loadable
+            raw = mne.io.read_raw_edf(edf_path, preload=True, verbose='WARNING')
 
             # Load XML data using the library function
             print(f"Loading XML: {xml_path}")
-            try:
-                # Assuming read_xml is defined later in this file or imported
-                events, stages, epoch_length, has_annotations = read_xml(xml_path)
-            except FileNotFoundError:
-                print(f"Error: XML file not found at {xml_path}. Skipping patient {k}.")
-                raw_data_list.append({}) # Append empty dict for raw data as well
-                xml_data_list.append({})
-                if raw: del raw # Clean up loaded raw object
-                continue # Skip to the next patient
-            except Exception as e:
-                print(f"Error reading XML file {xml_path}: {e}. Skipping patient {k}.")
-                raw_data_list.append({})
-                xml_data_list.append({})
-                if raw: del raw
-                continue
+            # Assume file exists and is readable by read_xml
+            events, stages, epoch_length, has_annotations = read_xml(xml_path)
 
             # --- Store EDF channel data ---
             patient_raw_data = {}
@@ -142,23 +112,19 @@ def load_patient_data(num_patients, base_input_dir, channels_dict, output_dir):
 
             # Extract data for the available channels among the requested ones
             if available_channels_in_edf:
-                try:
-                    # Pick only the desired channels from the raw object
-                    raw_picked = raw.copy().pick(picks=available_channels_in_edf, verbose='WARNING')
-                    # Get data returns a numpy array of shape (n_channels, n_times)
-                    extracted_data = raw_picked.get_data()
-                    # Store each channel's data in the dictionary
-                    for i, name in enumerate(raw_picked.ch_names):
-                        patient_raw_data[name] = extracted_data[i]
-                    print(f"  Extracted {len(available_channels_in_edf)} channels.")
-                    # Example shape print (optional, uncomment if needed)
-                    # if patient_raw_data:
-                    #    first_ch_name = list(patient_raw_data.keys())[0]
-                    #    print(f"  Example shape for '{first_ch_name}': {patient_raw_data[first_ch_name].shape}")
-
-                except Exception as e:
-                        print(f"Error extracting channels for patient {k}: {e}")
-                        patient_raw_data = {} # Reset to empty if extraction failed
+                # Assume extraction works
+                # Pick only the desired channels from the raw object
+                raw_picked = raw.copy().pick(picks=available_channels_in_edf, verbose='WARNING')
+                # Get data returns a numpy array of shape (n_channels, n_times)
+                extracted_data = raw_picked.get_data()
+                # Store each channel's data in the dictionary
+                for i, name in enumerate(raw_picked.ch_names):
+                    patient_raw_data[name] = extracted_data[i]
+                print(f"  Extracted {len(available_channels_in_edf)} channels.")
+                # Example shape print (optional, uncomment if needed)
+                # if patient_raw_data:
+                #    first_ch_name = list(patient_raw_data.keys())[0]
+                #    print(f"  Example shape for '{first_ch_name}': {patient_raw_data[first_ch_name].shape}")
             else:
                 print(f"Warning: None of the requested channels {channel_names_to_extract} were found in {edf_path}.")
                 # patient_raw_data remains {}
@@ -186,42 +152,24 @@ def load_patient_data(num_patients, base_input_dir, channels_dict, output_dir):
         print("\n--- Data Loading Loop Complete ---")
         print(f"Total patients attempted: {num_patients}")
         # Count how many patients had both EDF and XML successfully loaded and processed
+        # Note: With error handling removed, this count should always equal num_patients if the loop completes.
         successful_loads = sum(1 for i in range(len(raw_data_list)) if raw_data_list[i] and xml_data_list[i])
         print(f"Successfully loaded data sets (EDF+XML pairs): {successful_loads}")
 
         # --- Save the loaded data to cache ---
         if successful_loads > 0: # Only save if some data was actually loaded
             print(f"\nSaving loaded raw and XML data to cache files in {output_dir}...")
-            try:
-                # Ensure output directory exists (it should, but double-check)
-                os.makedirs(output_dir, exist_ok=True)
-                with open(raw_data_cache_path, 'wb') as f:
-                    pickle.dump(raw_data_list, f)
-                with open(xml_data_cache_path, 'wb') as f:
-                    pickle.dump(xml_data_list, f)
-                print("Data successfully saved to cache.")
-            except Exception as e:
-                print(f"Error saving data to cache: {e}")
+            # Assume saving works
+            # Ensure output directory exists (it should, but double-check)
+            os.makedirs(output_dir, exist_ok=True)
+            with open(raw_data_cache_path, 'wb') as f:
+                pickle.dump(raw_data_list, f)
+            with open(xml_data_cache_path, 'wb') as f:
+                pickle.dump(xml_data_list, f)
+            print("Data successfully saved to cache.")
         else:
+            # This case is less likely without error handling, but kept for consistency
             print("\nNo data successfully loaded, skipping cache saving.")
-
-
-    # --- Final Summary and Return ---
-    # Example check (more robust: find first successfully loaded patient)
-    first_loaded_idx = -1
-    for i in range(len(raw_data_list)):
-            if raw_data_list[i] and xml_data_list[i]:
-                first_loaded_idx = i
-                break
-
-    if first_loaded_idx != -1:
-        print(f"\nExample: Patient {first_loaded_idx+1} raw data channels: {list(raw_data_list[first_loaded_idx].keys())}")
-        print(f"Example: Patient {first_loaded_idx+1} XML data keys: {list(xml_data_list[first_loaded_idx].keys())}")
-    elif any(raw_data_list) or any(xml_data_list):
-            print("\nSome data loaded, but no patient had both EDF and XML successfully processed.")
-    else:
-        print("\nNo patient data was successfully loaded.")
-
 
     return raw_data_list, xml_data_list
 
@@ -496,6 +444,38 @@ def filter_data(raw_data, channels, sampling_rate, output_dir, normalize=True):
     return filtered_data_list
 
 
+def apply_ica_mne(raw_data, channels, sampling_rate, output_dir):
+    """
+    Apply ICA using MNE-Python to remove artifacts from EEG signals.
+
+    Args:
+        raw_data: List of dictionaries containing patient data
+        channels: Dictionary mapping channel indices to channel names
+        sampling_rate: Dictionary mapping channel indices to sampling rates
+        output_dir: Directory to save the cleaned data
+
+    Returns:
+        ica_cleaned_data: List of dictionaries containing patient data with cleaned EEG signals
+    """
+    # Check if processed data file already exists
+    processed_data_file = os.path.join(output_dir, 'ica_cleaned_data.pkl')
+    if os.path.exists(processed_data_file):
+        print(f"\nICA cleaned data file already exists at: {processed_data_file}")
+        print("Loading existing data instead of reprocessing.")
+        with open(processed_data_file, 'rb') as f:
+            ica_cleaned_data = pickle.load(f)
+        return ica_cleaned_data
+
+    print("\nApplying ICA for artifact removal...")
+    ica_cleaned_data_list = []
+    
+    ica = mne.preprocessing.ICA(n_components=2, method='infomax',max_iter='auto')
+    ica.fit(raw_data)
+    ica
+
+    return ica
+
+
 def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=['EEG', 'EEG(sec)'], artifact_channels=['EOG(L)', 'EOG(R)', 'EMG', 'ECG']):
     """
     Apply Independent Component Analysis (ICA) to remove artifacts from EEG signals.
@@ -550,28 +530,15 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
             original_lengths[name] = len(data)
 
             if name in eeg_channels:
-                if sr != target_sr:
-                     # This case should ideally not happen if all EEG channels have the same SR
-                    print(f"    Warning: EEG channel {name} has unexpected sampling rate {sr} Hz. Expected {target_sr} Hz. Skipping resampling for now.")
-                    ica_input_data.append(data)
-                else:
-                    print(f"    Using EEG channel: {name} (Length: {len(data)}, SR: {sr} Hz)")
-                    ica_input_data.append(data)
+                print(f"    Using EEG channel: {name} (Length: {len(data)}, SR: {sr} Hz)")
+                ica_input_data.append(data)
             
             elif name in artifact_channels:
-                if sr != target_sr:
-                    # Resample artifact channel to target SR
-                    target_len = int(len(data) * target_sr / sr)
-                    print(f"    Resampling artifact channel: {name} from {sr} Hz (Len: {len(data)}) to {target_sr} Hz (Target Len: {target_len})")
-                    resampled_sig = resample(data, target_len)
-                    ica_input_data.append(resampled_sig)
-                    resampled_artifact_data[name] = resampled_sig
-                else:
-                    print(f"    Using artifact channel: {name} (Length: {len(data)}, SR: {sr} Hz)")
-                    ica_input_data.append(data)
-                    resampled_artifact_data[name] = data # Store non-resampled too
+                print(f"    Using artifact channel: {name} (Length: {len(data)}, SR: {sr} Hz)")
+                ica_input_data.append(data)
+                resampled_artifact_data[name] = data
 
-        # Ensure all data streams for ICA have the same length (due to potential rounding in resampling)
+        # Ensure all data streams for ICA have the same length
         min_len = min(len(d) for d in ica_input_data)
         ica_input_matrix = np.array([d[:min_len] for d in ica_input_data]) # Shape: (n_channels, n_samples)
         
@@ -582,18 +549,9 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
 
         print(f"  - Running ICA on matrix of shape: {ica_input_matrix.shape}")
         n_components = ica_input_matrix.shape[0] # Use number of channels as components
-        ica = FastICA(n_components=n_components, random_state=0, whiten='unit-variance', max_iter=10000, tol=0.01)
+        ica = FastICA(n_components=n_components, random_state=90, whiten='unit-variance', max_iter=10000, tol=0.01)
         
-        try:
-            components = ica.fit_transform(ica_input_matrix.T).T # Input should be (samples, features); components shape (n_components, n_samples)
-        except Exception as e:
-            print(f"    Error during ICA fitting for patient {patient_idx + 1}: {e}")
-            print(f"    Skipping ICA for this patient and using original EEG data.")
-            # Copy original data if ICA fails
-            for name in patient_data:
-                 cleaned_patient_data[name] = patient_data[name]
-            ica_cleaned_data_list.append(cleaned_patient_data)
-            continue # Skip to next patient
+        components = ica.fit_transform(ica_input_matrix.T).T # Input should be (samples, features); components shape (n_components, n_samples)
 
         mixing_matrix = ica.mixing_ # Shape: (n_features, n_components)
         unmixing_matrix = ica.components_ # Shape: (n_components, n_features)
@@ -603,21 +561,22 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
         correlation_threshold = 0.7 # Adjust threshold as needed
 
         # Correlate components with (resampled) artifact channels
-        # component_idx_map = {name: i for i, name in enumerate(all_channel_names)} # Map name to row index in ica_input_matrix -- MOVED EARLIER
-
         for i in range(n_components):
+            
             component = components[i, :]
             for art_name in artifact_channels:
+                
                 if art_name in resampled_artifact_data:
                     artifact_signal = resampled_artifact_data[art_name][:min_len] # Ensure same length
                     correlation = np.abs(np.corrcoef(component, artifact_signal)[0, 1])
                     print(f"    Component {i} vs {art_name} correlation: {correlation:.3f}")
+                   
                     if correlation > correlation_threshold:
                         print(f"    -> Found artifact component {i} strongly correlated with {art_name}.")
+                        
                         if i not in artifact_indices:
                              artifact_indices.append(i)
-                        # Don't break here, a component might correlate with multiple artifacts
-
+                        
         # Reconstruct EEG signals, removing artifact components
         print(f"  - Reconstructing cleaned EEG signals (removing components: {artifact_indices})...")
         
@@ -641,30 +600,27 @@ def apply_ica(filtered_data, channels, sampling_rate, output_dir, eeg_channels=[
             plot_samples = int(plot_seconds * target_sr)
             
             for eeg_name in eeg_channels:
-                try:
-                    original_signal_plot = original_eeg_signals_for_plot[eeg_name][:plot_samples]
-                    
-                    # Find the corresponding cleaned signal from reconstructed_signals
-                    recon_idx = component_idx_map[eeg_name]
-                    cleaned_signal_plot = reconstructed_signals[recon_idx, :plot_samples]
+                
+                original_signal_plot = original_eeg_signals_for_plot[eeg_name][:plot_samples]
+                
+                # Find the corresponding cleaned signal from reconstructed_signals
+                recon_idx = component_idx_map[eeg_name]
+                cleaned_signal_plot = reconstructed_signals[recon_idx, :plot_samples]
 
-                    time_axis = np.arange(len(original_signal_plot)) / target_sr
+                time_axis = np.arange(len(original_signal_plot)) / target_sr
 
-                    plt.figure(figsize=(15, 6))
-                    plt.plot(time_axis, original_signal_plot, label=f'Filtered {eeg_name}', alpha=0.8)
-                    plt.plot(time_axis, cleaned_signal_plot, label=f'ICA Cleaned {eeg_name}', alpha=0.8)
-                    plt.title(f'Patient 1: {eeg_name} - Filtered vs ICA Cleaned ({plot_seconds} seconds)')
-                    plt.xlabel("Time (s)")
-                    plt.ylabel("Amplitude" + (" (Normalized)" if was_normalized else ""))
-                    plt.legend()
-                    plt.tight_layout()
-                    plot_filename = os.path.join(figures_dir, f"patient_1_{eeg_name}_ICA_comparison{file_suffix}.png")
-                    plt.savefig(plot_filename)
-                    plt.close()
-                    print(f"    Saved comparison plot: {plot_filename}")
-                except Exception as plot_e:
-                     print(f"    Could not generate plot for {eeg_name}: {plot_e}")
-        # --- End Plotting logic ---
+                plt.figure(figsize=(15, 6))
+                plt.plot(time_axis, original_signal_plot, label=f'Filtered {eeg_name}', alpha=0.8)
+                plt.plot(time_axis, cleaned_signal_plot, label=f'ICA Cleaned {eeg_name}', alpha=0.8)
+                plt.title(f'Patient 1: {eeg_name} - Filtered vs ICA Cleaned ({plot_seconds} seconds)')
+                plt.xlabel("Time (s)")
+                plt.ylabel("Amplitude" + (" (Normalized)" if was_normalized else ""))
+                plt.legend()
+                plt.tight_layout()
+                plot_filename = os.path.join(figures_dir, f"patient_1_{eeg_name}_ICA_comparison{file_suffix}.png")
+                plt.savefig(plot_filename)
+                plt.close()
+                print(f"    Saved comparison plot: {plot_filename}")
 
 
         # Store cleaned EEG and original artifact channels
@@ -904,8 +860,6 @@ def wavelet_decomposition(processed_data, channels, sampling_rate, output_dir):
         for ch_key in eeg_channel_keys:
             ch_name = channels[ch_key]
             fs = sampling_rate[ch_key]
-            if fs != 125:
-                 print(f"Warning: Unexpected sampling rate {fs} for {ch_name}. Wavelet band mapping assumes 125 Hz.")
 
             ch_epochs = subject_data[ch_name]
             channel_bands = {'Original': ch_epochs}
@@ -2235,3 +2189,117 @@ def generate_final_visualizations_nn(features_dataframe, xml_data, label_encoder
         print("    Skipping spindle density plot: 'SpindleDensity' column not found.")
 
     print("--- Finished Generating Final Visualizations (Neural Network) ---")
+
+def plot_wavelet_decomposition(wavelet_data, channels, sampling_rate, output_dir, 
+                              subject_index, eeg_channel_name, epoch_to_plot=None):
+    """Generates a plot showing the wavelet decomposition for a single epoch.
+
+    Args:
+        wavelet_data (list): Output from wavelet_decomposition.
+        channels (dict): Channel mapping dictionary.
+        sampling_rate (dict): Sampling rate dictionary.
+        output_dir (str): Base directory to save the plot.
+        subject_index (int): Index of the subject to plot (0-based).
+        eeg_channel_name (str): Name of the EEG channel used for wavelet decomposition.
+        epoch_to_plot (int, optional): Index of the epoch to plot (0-based).
+                                       If None, the middle epoch is chosen.
+    """
+    print(f"\nGenerating wavelet decomposition plot for Subject {subject_index + 1}, Channel {eeg_channel_name}...")
+
+    # --- 1. Input Validation and Data Selection ---
+    if subject_index >= len(wavelet_data):
+        print(f"Error: Subject index {subject_index} is out of bounds.")
+        return
+        
+    subject_wavelet_data = wavelet_data[subject_index]
+
+    if eeg_channel_name not in subject_wavelet_data:
+        print(f"Error: EEG channel '{eeg_channel_name}' not found in wavelet data for Subject {subject_index + 1}.")
+        return
+        
+    channel_data = subject_wavelet_data[eeg_channel_name]
+    bands_available = list(channel_data.keys())
+    bands_to_plot = ['Original', 'Delta', 'Theta', 'Alpha', 'Sigma', 'Beta', 'Gamma']
+
+    if 'Original' not in channel_data or not channel_data['Original']:
+        print(f"Error: No 'Original' epoch data found for {eeg_channel_name}. Cannot plot.")
+        return
+
+    num_epochs = len(channel_data['Original'])
+    if num_epochs == 0:
+        print(f"Warning: No epochs found for channel '{eeg_channel_name}'. Cannot generate plot.")
+        return
+
+    # Choose epoch to plot
+    if epoch_to_plot is None:
+        epoch_to_plot = num_epochs // 2 # Default to middle epoch
+    elif epoch_to_plot >= num_epochs:
+        print(f"Warning: Requested epoch {epoch_to_plot} out of bounds (0-{num_epochs-1}). Plotting epoch 0 instead.")
+        epoch_to_plot = 0
+        
+    print(f"  Plotting epoch index: {epoch_to_plot}")
+
+    # Find channel key for sampling rate
+    channel_key = None
+    for key, name in channels.items():
+        if name == eeg_channel_name:
+            channel_key = key
+            break
+    if channel_key is None: 
+        print(f"Warning: Could not find channel key for '{eeg_channel_name}'. Cannot determine time axis accurately.")
+        fs = 1 # Assign dummy sampling rate
+    else:
+        fs = sampling_rate[channel_key]
+
+    # --- 2. Prepare Data for Plotting --- 
+    epoch_signals = {}
+    max_samples = 0
+    for band_name in bands_to_plot:
+        if band_name in channel_data and len(channel_data[band_name]) > epoch_to_plot:
+            signal = channel_data[band_name][epoch_to_plot]
+            epoch_signals[band_name] = signal
+            if len(signal) > max_samples:
+                max_samples = len(signal)
+        else:
+            print(f"Warning: Data for band '{band_name}' not found for epoch {epoch_to_plot}. Skipping band.")
+            # Remove band from plotting list if data is missing
+            if band_name in bands_to_plot: 
+                bands_to_plot.remove(band_name)
+                
+    if not epoch_signals or 'Original' not in epoch_signals:
+        print("Error: Could not retrieve any band data for the selected epoch. Cannot plot.")
+        return
+        
+    # --- 3. Plotting --- 
+    n_bands_to_plot = len(epoch_signals)
+    fig, axes = plt.subplots(n_bands_to_plot, 1, figsize=(12, 2 * n_bands_to_plot), sharex=True)
+    fig.suptitle(f'Subject {subject_index + 1} - {eeg_channel_name} - Wavelet Decomposition (Epoch {epoch_to_plot})')
+
+    if n_bands_to_plot == 1:
+        axes = [axes] # Ensure axes is iterable even with one subplot
+
+    plot_idx = 0
+    for band_name in bands_to_plot: # Iterate in the defined order
+        if band_name in epoch_signals:
+            signal = epoch_signals[band_name]
+            current_time_axis = np.arange(len(signal)) / fs # Use actual length for this band
+            axes[plot_idx].plot(current_time_axis, signal)
+            axes[plot_idx].set_title(band_name)
+            axes[plot_idx].set_ylabel('Amplitude')
+            axes[plot_idx].grid(True, linestyle='--', alpha=0.6)
+            plot_idx += 1
+
+    axes[-1].set_xlabel('Time (s)')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95]) # Adjust layout
+
+    # --- 4. Save Plot --- 
+    plot_output_dir = os.path.join(output_dir, 'Figures', 'WaveletDecomposition')
+    os.makedirs(plot_output_dir, exist_ok=True)
+    plot_filename = os.path.join(plot_output_dir, f'subject_{subject_index + 1}_{eeg_channel_name}_epoch_{epoch_to_plot}_wavelets.png')
+    
+    try:
+        plt.savefig(plot_filename)
+        print(f"  Plot saved to: {plot_filename}")
+    except Exception as e:
+        print(f"Error saving plot: {e}")
+    plt.close(fig) # Close the figure to free memory

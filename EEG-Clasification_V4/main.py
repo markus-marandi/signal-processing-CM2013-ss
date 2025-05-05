@@ -22,7 +22,8 @@ if __name__ == "__main__":
         4: 'EMG',   # 0-based index for position 5
         5: 'EOG(L)',  # 0-based index for position 6
         6: 'EOG(R)',  # 0-based index for position 7
-        7: 'EEG'    # 0-based index for position 8
+        7: 'EEG',    # 0-based index for position 8
+        10: 'ABDO RES'  # 0-based index for position 11
     }
 
     # Create a dict for sampling rate
