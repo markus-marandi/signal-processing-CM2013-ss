@@ -101,7 +101,7 @@ def load_patient_data(num_patients, base_input_dir, channels_dict, output_dir):
             # --- Store EDF channel data ---
             patient_raw_data = {}
             # Use the channel names from the 'channels_dict' argument
-            channel_names_to_extract = list(channels_dict.values())
+            channel_names_to_extract = list(channels_dict) # channel_names_to_extract = list(channels_dict.values())
 
             # Verify which requested channels are actually available in the EDF file
             available_channels_in_edf = [ch for ch in channel_names_to_extract if ch in raw.ch_names]
@@ -301,26 +301,37 @@ def create_epochs(raw_data, channels, sampling_rate, output_dir):
 
 # ==== FILTER HELPERS ====
 
-def butter_bandpass(lowcut, highcut, fs, order=4):
-    nyq = 0.5 * fs
+def butter_bandpass(data, lowcut, highcut, FS, order=4):
+    nyq = 0.5 * FS
     b, a = signal.butter(order, [lowcut / nyq, highcut / nyq], btype='band')
-    return b, a
+    return signal.filtfilt(b, a, data)
 
-def butter_highpass(cutoff, fs, order=4):
-    nyq = 0.5 * fs
-    b, a = signal.butter(order, cutoff / nyq, btype='high')
-    return b, a
+def notch_filter(data, FS, freq=50.0, Q=30):
+    """
+    Apply a notch filter to remove a specific frequency component (e.g., power line noise).
 
-def butter_lowpass(cutoff, fs, order=4):
-    nyq = 0.5 * fs
-    if cutoff >= nyq:
-        cutoff = nyq - 1  # adjust to safe margin
-    b, a = signal.butter(order, cutoff / nyq, btype='low')
-    return b, a
+    Parameters
+    ----------
+    data : array_like
+        The input signal data.
+    FS : float
+        The sampling frequency of the signal (in Hz).
+    freq : float, optional
+        The frequency to remove (the notch frequency, in Hz). Default is 50.0 Hz.
+    Q : float, optional
+        The quality factor. It determines the bandwidth of the notch filter.
+        The relationship is `bandwidth = freq / Q`. A higher Q value results
+        in a narrower notch, affecting fewer surrounding frequencies.
+        A lower Q value results in a wider notch. Default is 30.
 
-def notch_filter(signal, fs, freq=50.0, Q=30):
-    b, a = signal.iirnotch(freq, Q, fs)
-    return signal.filtfilt(b, a, signal)
+    Returns
+    -------
+    array_like
+        The signal data after applying the notch filter.
+    """
+    
+    b, a = signal.iirnotch(freq, Q, fs=FS) # Use fs=FS for clarity as per scipy docs
+    return signal.filtfilt(b, a, data)
 
 
 def filter_data(raw_data, channels, sampling_rate, output_dir, normalize=True):
