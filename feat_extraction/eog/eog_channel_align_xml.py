@@ -1,5 +1,5 @@
 import pandas as pd
-from utils.eog.eog_epoch_feature_extraction import extract_epoch_features, segment_signal_into_epochs
+from feat_extraction.eog.eog_epoch_feature_extraction import extract_epoch_features, segment_signal_into_epochs
 
 
 # --- Example: A dummy implementation of get_edf_header_and_record ---
